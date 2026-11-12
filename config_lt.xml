@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<module>
+    <name>mijoravenipak</name>
+    <displayName><![CDATA[Venipak siuntimas]]></displayName>
+    <version><![CDATA[1.2.2]]></version>
+    <description><![CDATA[Shipping module for Venipak delivery method]]></description>
+    <author><![CDATA[mijora.lt]]></author>
+    <tab><![CDATA[shipping_logistics]]></tab>
+	<confirmUninstall><![CDATA[Are you sure you want to uninstall?]]></confirmUninstall>
+    <is_configurable>1</is_configurable>
+    <need_instance>0</need_instance>
+</module>

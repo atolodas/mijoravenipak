@@ -1,0 +1,18 @@
+# Generated shipment labels and manifests - contain customer personal data
+/pdf/labels/*
+!/pdf/labels/index.php
+/pdf/manifests/*
+!/pdf/manifests/index.php
+
+# Runtime logs
+/logs/*
+!/logs/index.php
+
+# Pickup points / countries cache, downloaded from Venipak API at runtime
+/data/*.json
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
