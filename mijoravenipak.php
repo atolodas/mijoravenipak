@@ -1,0 +1,3305 @@
+<?php
+
+require_once __DIR__ . "/classes/MjvpCart.php";
+require_once  __DIR__ . "/classes/MjvpManifest.php";
+require_once __DIR__ . "/classes/MjvpWarehouse.php";
+require_once __DIR__ . "/classes/MjvpApi.php";
+require_once __DIR__ . "/classes/MjvpFiles.php";
+require_once __DIR__ . "/classes/MjvpDb.php";
+require_once __DIR__ . "/classes/MjvpHelper.php";
+require_once __DIR__ . "/classes/MjvpModuleConfig.php";
+
+if (!defined('_PS_VERSION_')) {
+    exit;
+}
+
+$autoloadPath = __DIR__ . '/vendor/autoload.php';
+if (file_exists($autoloadPath)) {
+    require_once $autoloadPath;
+}
+
+class MijoraVenipak extends CarrierModule
+{
+    const CONTROLLER_SHIPPING = 'AdminVenipakShipping';
+    const CONTROLLER_WAREHOUSE = 'AdminVenipakWarehouse';
+    const CONTROLLER_ADMIN_AJAX = 'AdminVenipakshippingAjax';
+    const CONTROLLER_ADMIN_MANIFEST = 'AdminVenipakManifests';
+    const EXTRA_FIELDS_SIZE = 10;
+    const CARRIER_CALL_MINIMUM_DIFFERENCE = 2; // hours
+    const RETURN_DAYS_DEFAULT = 14;
+    const DEFAULT_LIVE_API_SERVER = 'https://go.venipak.lt/';
+    const DEFAULT_TEST_API_SERVER = 'https://venipak.uat.megodata.com/';
+
+    /**
+     * Debug mode activation, which writes operations to log files
+     */
+    public static $debug_mode = false;
+
+    /**
+     * List of carriers
+     *
+     * type - Carrier type (courier/pickup)
+     * id_name - Name for ID in database
+     * reference_name - Name for Reference in database
+     * title - Carrier title
+     * image - Carrier image file in module images directory
+     */
+    public static $_carriers = array(
+        'courier' => array(
+            'type' => 'courier',
+            'id_name' => 'MJVP_COURIER_ID',
+            'reference_name' => 'MJVP_COURIER_ID_REFERENCE',
+            'title' => 'Venipak courier',
+            'image' => 'venipak-logo-square.png',
+        ),
+        'pickup' => array(
+            'type' => 'pickup',
+            'id_name' => 'MJVP_PICKUP_ID',
+            'reference_name' => 'MJVP_PICKUP_ID_REFERENCE',
+            'title' => 'Venipak pickup point',
+            'image' => 'venipak-logo-square.png',
+        ),
+    );
+
+    /**
+     * Main module directory path
+     */
+    public static $_moduleDir = _PS_MODULE_DIR_ . 'mijoravenipak/';
+    public static $_labelPdfDir = _PS_MODULE_DIR_ . 'mijoravenipak/pdf/labels/';
+    public static $_manifestPdfDir = _PS_MODULE_DIR_ . 'mijoravenipak/pdf/manifests/';
+
+    /**
+     * Default countries list for pickup points
+     */
+    public static $_defaultPickupCountries = array('lt', 'lv', 'ee', 'pl');
+
+    /**
+     * COD modules
+     */
+    public static $_codModules = array('ps_cashondelivery', 'venipakcod');
+
+    public $deliveryTimes = [];
+
+    public $id_carrier = false;
+
+    public $terminal_count;
+
+    public static $_order_additional_info = array(
+        'door_code' => '',
+        'cabinet_number' => '',
+        'warehouse_number' => '',
+        'delivery_time' => 0,
+        'carrier_call' => 0
+    );
+
+    /**
+     * Global constants list
+     */
+    public static $_globalConstants = array(
+        'last_upd_countries' => 'MJVP_LAST_UPDATE_COUNTRIES',
+        'last_upd_terminals' => 'MJVP_LAST_UPDATE_TERMINALS',
+    );
+
+    /**
+     * Hooks used on every supported PrestaShop version.
+     * Only canonical hook names are used - aliases (header, updateCarrier...) are deprecated
+     * since PS 1.7 and trigger E_USER_DEPRECATED on PS 8/9, also they may cause double execution.
+     */
+    protected $_hooks = array(
+        'displayHeader',
+        'displayCarrierExtraContent',
+        'actionCarrierUpdate',
+        'actionValidateStepComplete',
+        'actionValidateOrder',
+        'actionAdminControllerSetMedia',
+    );
+
+    /**
+     * Hooks for PS 1.7.7+ (Symfony order pages: PS 1.7.7, 8.x, 9.x)
+     */
+    protected $_hooksSymfonyOrders = array(
+        'displayAdminOrderMain',
+        'actionOrderGridDefinitionModifier',
+    );
+
+    /**
+     * Hooks for legacy order pages (PS < 1.7.7)
+     */
+    protected $_hooksLegacyOrders = array(
+        'displayAdminOrder',
+        'actionAdminOrdersListingFieldsModifier',
+        'displayAdminListBefore',
+    );
+
+    /**
+     * Hooks only for PS 1.6 checkout
+     */
+    protected $_hooksPs16 = array(
+        'actionCarrierProcess',
+    );
+
+    /**
+     * Hooks which were used by older module versions and must be removed on upgrade
+     */
+    protected $_obsoleteHooks = array(
+        'header',
+        'updateCarrier',
+    );
+
+    /**
+     * List of fields keys in module configuration
+     */
+    public $_configKeys = array(
+        'API' => array(
+            'username' => 'MJVP_API_USER',
+            'password' => 'MJVP_API_PASS',
+            'id' => 'MJVP_API_ID',
+            'live_mode' => 'MJVP_API_LIVE_MODE',
+            'live_api_server' => 'MJVP_LIVE_API_SERVER',
+            'test_api_server' => 'MJVP_TEST_API_SERVER',
+        ),
+        'SHOP' => array(
+            'sender_name' => 'MJVP_SENDER_NAME',
+            'shop_contact' => 'MJVP_SHOP_CONTACT',
+            'company_code' => 'MJVP_SHOP_COMPANY_CODE',
+            'shop_country_code' => 'MJVP_SHOP_COUNTRY_CODE',
+            'shop_city' => 'MJVP_SHOP_CITY',
+            'shop_address' => 'MJVP_SHOP_ADDRESS',
+            'shop_postcode' => 'MJVP_SHOP_POSTCODE',
+            'shop_phone' => 'MJVP_SHOP_PHONE',
+            'shop_email' => 'MJVP_SHOP_EMAIL',
+            'sender_address' => 'MJVP_SENDER_ADDRESS',
+        ),
+        'COURIER' => array(
+            'door_code' => 'MJVP_COURIER_DOOR_CODE',
+            'warehouse_number' => 'MJVP_COURIER_WAREHOUSE_NUMBER',
+            'cabinet_number' => 'MJVP_COURIER_CABINET_NUMBER',
+            'delivery_time' => 'MJVP_COURIER_DELIVERY_TIME',
+            'call_before_delivery' => 'MJVP_COURIER_CALL_BEFORE_DELIVERY',
+            'return_service' => 'MJVP_RETURN_SERVICE',
+            'return_days' => 'MJVP_RETURN_DAYS',
+        ),
+        'LABEL' => array(
+            'label_size' => 'MJVP_LABEL_SIZE',
+            'label_counter' => 'MJVP_COUNTER_PACKS',
+        ),
+        'ADVANCED' => array(
+            'carrier_disable_passphrase' => 'MJVP_CARRIER_DISABLE_PASSPHRASE',
+            'pickup_point_types' => 'MJVP_PICKUP_POINT_TYPES',
+        ),
+    );
+
+    public $_configKeysOther = array(
+        'counter_manifest' => array(
+            'key' => 'MJVP_COUNTER_MANIFEST',
+            'default_value' => array('counter' => 0, 'date' => ''),
+        ),
+        'counter_packs' => array(
+            'key' => 'MJVP_COUNTER_PACKS',
+            'default_value' => 0,
+        ),
+        'label_size' => array(
+            'key' => 'MJVP_LABEL_SIZE',
+            'default_value' => 'a6',
+        ),
+        'last_manifest_id' => array(
+            'key' => 'MJVP_LAST_MANIFEST_ID',
+            'default_value' => 0,
+        ),
+    );
+
+    /**
+     * List of configuration keys that support per-store values in multistore mode.
+     * Keys not listed here will always be saved/loaded globally.
+     * If a store-specific key has no value for a particular store, the global value is used as fallback.
+     */
+    public static $_multistoreKeys = array(
+        'MJVP_SENDER_NAME',
+        'MJVP_SHOP_COMPANY_CODE',
+        'MJVP_SHOP_ADDRESS',
+        'MJVP_SHOP_CITY',
+        'MJVP_SHOP_COUNTRY_CODE',
+        'MJVP_SHOP_POSTCODE',
+        'MJVP_SHOP_CONTACT',
+        'MJVP_SHOP_PHONE',
+        'MJVP_SHOP_EMAIL',
+        'MJVP_COURIER_DOOR_CODE',
+        'MJVP_COURIER_CABINET_NUMBER',
+        'MJVP_COURIER_WAREHOUSE_NUMBER',
+        'MJVP_COURIER_CALL_BEFORE_DELIVERY',
+        'MJVP_RETURN_SERVICE',
+        'MJVP_COURIER_DELIVERY_TIME',
+        'MJVP_COUNTER_PACKS',
+        'MJVP_CARRIER_DISABLE_PASSPHRASE',
+    );
+
+    /**
+     * Fields names and required
+     */
+    private function getConfigField($section_id, $config_key)
+    {
+        $cModuleConfig = new MjvpModuleConfig();
+
+        if ($section_id == 'SHOP') {
+            if($config_key == 'sender_address')
+                return array('name' => str_replace('_', ' ', $config_key), 'required' => false);
+            return array('name' => str_replace('_', ' ', $config_key), 'required' => true);
+        }
+
+        if ($section_id == 'LABEL') {
+            if ($config_key == $cModuleConfig->getConfigKey('label_counter', $section_id)) {
+                return array(
+                    'name' => $this->l('Last pack number'),
+                    'required' => false,
+                    'type' => 'number',
+                    'min' => Configuration::get($config_key),
+                    'max' => 9999999,
+                );
+            }
+        }
+
+        if ($section_id == 'ADVANCED') {
+            if ($config_key == $cModuleConfig->getConfigKey('carrier_disable_passphrase', $section_id)) {
+                return array(
+                    'name' => $this->l('Carrier disable passphrase'),
+                    'validate' => 'isGenericName',
+                );
+            }
+        }
+
+        return array('name' => 'ERROR_' . $config_key, 'required' => false);
+    }
+
+    public static $_order_states = array(
+        'order_state_ready' => array(
+            'key' => 'MJVP_ORDER_STATE_READY',
+            'color' => '#FCEAA8',
+            'lang' => array(
+                'en' => 'Venipak shipment ready',
+                'lt' => 'Venipak siunta paruošta',
+            ),
+        ),
+        'order_state_error' => array(
+            'key' => 'MJVP_ORDER_STATE_ERROR',
+            'color' => '#F24017',
+            'lang' => array(
+                'en' => 'Error on Venipak shipment',
+                'lt' => 'Klaida Venipak siuntoje',
+            ),
+        ),
+    );
+
+    public static $_classes = [
+        'MjvpCart',
+        'MjvpManifest',
+        'MjvpWarehouse',
+        'MjvpApi',
+        'MjvpFiles',
+        'MjvpDb',
+        'MjvpHelper',
+        'MjvpModuleConfig'
+    ];
+
+    /**
+     * Class constructor
+     */
+    public function __construct()
+    {
+        $this->name = 'mijoravenipak';
+        $this->tab = 'shipping_logistics';
+        $this->version = '1.3.0';
+        $this->author = 'mijora.lt';
+        $this->need_instance = 0;
+        $this->ps_versions_compliancy = array('min' => '1.6.0', 'max' => _PS_VERSION_);
+        $this->bootstrap = true;
+
+        parent::__construct();
+
+        $this->displayName = $this->l('Venipak Shipping');
+        $this->description = $this->l('Shipping module for Venipak delivery method');
+        $this->available_countries = array('LT', 'LV', 'EE', 'PL');
+        $this->countries_names = array('LT' => 'Lithuania', 'LV' => 'Latvia', 'EE' => 'Estonia', 'PL' => 'Poland');
+        $this->confirmUninstall = $this->l('Are you sure you want to uninstall?');
+        $this->deliveryTimes = [
+            'nwd' => $this->l('Anytime'),
+            'nwd10' => $this->l('Until 10:00'),
+            'nwd12' => $this->l('Until 12:00'),
+            'nwd8_14' => $this->l('8:00-14:00'),
+            'nwd14_17' => $this->l('14:00-17:00'),
+            'nwd18_22' => $this->l('18:00-22:00'),
+        ];
+
+        foreach ($this->deliveryTimes as $key => $deliveryTime)
+        {
+            $this->_configKeys['COURIER']['delivery_time_' . $key] = 'MJVP_COURIER_DELIVERY_TIME_' . strtoupper($key);
+        }
+    }
+
+    public function getModuleService($service_name, $id = null)
+    {
+        $reflection = new \ReflectionClass($service_name);
+        if(class_exists($service_name) && in_array($service_name, self::$_classes))
+            return $id ? $reflection->newInstanceArgs([$id]) : $reflection->newInstance() ;
+        elseif (!class_exists($service_name) && in_array($service_name, self::$_classes))
+        {
+            require_once __DIR__ . 'classes/' . $service_name . '.php';
+            return $id ? $reflection->newInstanceArgs([$id]) : $reflection->newInstance() ;
+        }
+    }
+
+    /**
+     * Module installation function
+     */
+    public function install()
+    {
+        Configuration::updateValue($this->_configKeys['API']['live_api_server'], self::DEFAULT_LIVE_API_SERVER);
+        Configuration::updateValue($this->_configKeys['API']['test_api_server'], self::DEFAULT_TEST_API_SERVER);
+        Configuration::updateValue($this->_configKeys['API']['live_mode'], 1);
+        if (extension_loaded('curl') == false) {
+            $this->_errors[] = $this->l('You have to enable the cURL extension on your server to install this module');
+            return false;
+        }
+
+        if (!parent::install()) {
+            return false;
+        }
+
+        foreach ($this->getHooksList() as $hook) {
+            if (!$this->registerHook($hook)) {
+                $this->_errors[] = $this->l('Failed to install hook') . ' ' . $hook . '.';
+                return false;
+            }
+        }
+
+        if (!$this->createDbTables()) {
+            $this->_errors[] = $this->l('Failed to create tables.');
+            return false;
+        }
+
+        if (!$this->addOrderStates()) {
+            $this->_errors[] = $this->l('Failed to order states.');
+            return false;
+        }
+
+        foreach (self::$_carriers as $carrier) {
+            if (!$this->createCarrier($carrier['id_name'], $carrier['title'], $carrier['image'])) {
+                $this->_errors[] = $this->l('Failed to create carrier') . ' ' . $carrier['id_name'] . '.';
+                return false;
+            }
+        }
+
+        if (!$this->createOtherDbRecords()) {
+            $this->_errors[] = $this->l('Failed to create other database records.');
+            return false;
+        }
+        $this->registerTabs();
+        $this->updateTerminals();
+
+        return true;
+    }
+
+    /**
+     * Provides list of Admin controllers info
+     *
+     * @return array BackOffice Admin controllers
+     */
+    private function getModuleTabs()
+    {
+        return array(
+            self::CONTROLLER_SHIPPING => array(
+                'title' => $this->l('Venipak Orders'),
+                'parent_tab' => (int) Tab::getIdFromClassName('AdminParentShipping')
+            ),
+            self::CONTROLLER_WAREHOUSE => array(
+                'title' => $this->l('Venipak Warehouses'),
+                'parent_tab' => (int) Tab::getIdFromClassName('AdminParentShipping')
+            ),
+            self::CONTROLLER_ADMIN_AJAX => array(
+                'title' => $this->l('VenipakAdminAjax'),
+                'parent_tab' => -1
+            ),
+            self::CONTROLLER_ADMIN_MANIFEST => array(
+                'title' => $this->l('Venipak Manifests'),
+                'parent_tab' => -1
+            )
+        );
+    }
+
+    /**
+     * Registers module Admin tabs (controllers)
+     */
+    private function registerTabs()
+    {
+        $tabs = $this->getModuleTabs();
+
+        if (empty($tabs)) {
+            return true; // Nothing to register
+        }
+
+        foreach ($tabs as $controller => $tabData) {
+            $tab = new Tab();
+            $tab->active = 1;
+            $tab->class_name = $controller;
+            $tab->name = array();
+            $languages = Language::getLanguages(false);
+
+            foreach ($languages as $language) {
+                $tab->name[$language['id_lang']] = $tabData['title'];
+            }
+
+            $tab->id_parent = $tabData['parent_tab'];
+            $tab->module = $this->name;
+            if (!$tab->save()) {
+                $this->displayError($this->l('Error while creating tab ') . $tabData['title']);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Add Venipak order states
+     */
+    private function addOrderStates()
+    {
+
+        foreach (self::$_order_states as $os)
+        {
+            $order_state = (int)Configuration::get($os['key']);
+            $order_status = new OrderState($order_state, (int)Context::getContext()->language->id);
+
+            if (!$order_status->id || !$order_state) {
+                $orderState = new OrderState();
+                $orderState->name = array();
+                foreach (Language::getLanguages() as $language) {
+                    if (strtolower($language['iso_code']) == 'lt')
+                        $orderState->name[$language['id_lang']] = $os['lang']['lt'];
+                    else
+                        $orderState->name[$language['id_lang']] = $os['lang']['en'];
+                }
+                $orderState->send_email = false;
+                $orderState->color = $os['color'];
+                $orderState->hidden = false;
+                $orderState->delivery = false;
+                $orderState->logable = true;
+                $orderState->invoice = false;
+                $orderState->unremovable = false;
+                if ($orderState->add()) {
+                    Configuration::updateValue($os['key'], $orderState->id);
+                }
+                else
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Deletes module Admin controllers
+     * Used for module uninstall
+     *
+     * @return bool Module Admin controllers deleted successfully
+     *
+     * @throws PrestaShopDatabaseException
+     * @throws PrestaShopException
+     */
+    private function deleteTabs()
+    {
+        $tabs = $this->getModuleTabs();
+
+        if (empty($tabs)) {
+            return true; // Nothing to remove
+        }
+
+        foreach (array_keys($tabs) as $controller) {
+            $idTab = (int) Tab::getIdFromClassName($controller);
+            $tab = new Tab((int) $idTab);
+
+            if (!Validate::isLoadedObject($tab)) {
+                continue; // Nothing to remove
+            }
+
+            if (!$tab->delete()) {
+                $this->displayError($this->l('Error while uninstalling tab') . ' ' . $tab->name);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Module uninstall function
+     */
+    public function uninstall()
+    {
+        $cDb = new MjvpDb();
+
+        $cDb->deleteTables();
+        $this->deleteTabs();
+
+        foreach (self::$_carriers as $carrier) {
+            if (!$this->deleteCarrier($carrier['id_name'])) {
+                $this->_errors[] = $this->l('Failed to delete carrier') . ' ' . $carrier['id_name'] . '.';
+                return false;
+            }
+        }
+
+        if (!parent::uninstall()) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Compute the shipping price depending on the ranges that were set in the back office
+     */
+    public function getOrderShippingCost($params, $shipping_cost)
+    {
+        $pickupCarrier = Carrier::getCarrierByReference(Configuration::get(self::$_carriers['pickup']['reference_name']));
+        if($params instanceof CartCore)
+        {
+            $cart = $params;
+            if($this->checkCarrierDisablePassphrase($cart))
+                return false;
+
+            // Check pickup carrier, if there are any terminals for cart weight.
+            // Only run terminal filtering on checkout page, not on cart page.
+            $is_checkout = isset($this->context->controller->php_self)
+                && in_array($this->context->controller->php_self, ['order', 'order-opc']);
+            if($is_checkout && empty($this->terminal_count))
+            {
+                $order = null;
+                if(method_exists(Order::class, 'getByCartId'))
+                {
+                    $order = Order::getByCartId($cart->id);
+                }
+                elseif(method_exists(Order::class, 'getOrderByCartId'))
+                {
+                    $id_order = (int) Order::getOrderByCartId($cart->id);
+                    if ( ! empty($id_order) ) {
+                        $order = new Order($id_order);
+                    }
+                }
+
+                if($order)
+                {
+                    $filtered_terminals = $this->getFilteredTerminals([], $order);
+                }
+                else
+                {
+                    $filtered_terminals = $this->getFilteredTerminals([], $cart);
+                }
+
+                $this->terminal_count = count($filtered_terminals);
+            }
+            if($is_checkout && $this->id_carrier == $pickupCarrier->id && $this->terminal_count == 0)
+                return false; 
+        }
+        return $shipping_cost;
+    }
+
+    /**
+     * Check if cart contains products, whose description contains @carrier_disable_passphrase
+     */
+    private function checkCarrierDisablePassphrase($cart)
+    {
+        $cModuleConfig = new MjvpModuleConfig();
+        $carrier_disable_passphrase = Configuration::get($cModuleConfig->getConfigKey('carrier_disable_passphrase', 'ADVANCED'));
+        if($carrier_disable_passphrase)
+        {
+
+            $cart_products = $cart->getProducts();
+            $id_lang = $this->context->language->id;
+            foreach ($cart_products as $product)
+            {
+                // Cart products don't have description, so get it.
+                $product_description = Db::getInstance()->getValue(
+                    (new DbQuery())
+                        ->select('description')
+                        ->from('product_lang')
+                        ->where('`id_product` = ' . $product['id_product'] . ' AND `id_lang` = ' . $id_lang)
+                );
+
+                /**
+                 * Carrier cannot be used for the cart, if cart contains any product, whose description contains @carrier_disable_passphrase
+                 */
+                if(strpos($product_description, $carrier_disable_passphrase) !== false)
+                    return true;
+            }
+
+        }
+        return false;
+    }
+
+    /**
+     * Compute the shipping price without using the ranges
+     */
+    public function getOrderShippingCostExternal($params)
+    {
+        return true;
+    }
+
+    /**
+     * Creates a shipping method
+     */
+    public function createCarrier($key, $name, $image = '')
+    {
+        $carrier = new Carrier();
+        $carrier->name = $name;
+        $carrier->delay[Configuration::get('PS_LANG_DEFAULT')] = '1-2 business days';
+        $carrier->is_module = true;
+        $carrier->external_module_name = $this->name;
+        $carrier->need_range = true;
+        $carrier->range_behavior = 0;
+        $carrier->shipping_external = true;
+        $carrier->shipping_handling = false;
+        $carrier->url = '';
+        $carrier->active = true;
+        $carrier->deleted = 0;
+
+        if (!$carrier->add()) {
+            return false;
+        }
+
+        $groups = Group::getGroups(true);
+        foreach ($groups as $group) {
+            Db::getInstance()->insert('carrier_group', array(
+                'id_carrier' => (int) $carrier->id,
+                'id_group' => (int) $group['id_group']
+            ));
+        }
+
+        $rangePrice = new RangePrice();
+        $rangePrice->id_carrier = (int) $carrier->id;
+        $rangePrice->delimiter1 = '0';
+        $rangePrice->delimiter2 = '1000';
+        $rangePrice->add();
+
+        $rangeWeight = new RangeWeight();
+        $rangeWeight->id_carrier = (int) $carrier->id;
+        $rangeWeight->delimiter1 = '0';
+        $rangeWeight->delimiter2 = '1000';
+        $rangeWeight->add();
+
+        $zones = Zone::getZones(true);
+        foreach ($zones as $zone) {
+            Db::getInstance()->insert(
+                'carrier_zone',
+                array('id_carrier' => (int) $carrier->id, 'id_zone' => (int) $zone['id_zone'])
+            );
+            Db::getInstance()->insert(
+                'delivery',
+                array('id_carrier' => (int) $carrier->id, 'id_range_price' => (int) $rangePrice->id, 'id_range_weight' => NULL, 'id_zone' => (int) $zone['id_zone'], 'price' => '0')
+            );
+            Db::getInstance()->insert(
+                'delivery',
+                array('id_carrier' => (int) $carrier->id, 'id_range_price' => NULL, 'id_range_weight' => (int) $rangeWeight->id, 'id_zone' => (int) $zone['id_zone'], 'price' => '0')
+            );
+        }
+        try {
+            $image_path = self::$_moduleDir . 'views/images/' . $image;
+            $image_path = (empty($image)) ? self::$_moduleDir . 'logo.png' : $image_path;
+
+            $this->setCarrierLogo($carrier->id, $image_path);
+        } catch (Exception $e) {
+        }
+
+        Configuration::updateValue($key, $carrier->id);
+        Configuration::updateValue($key . '_REFERENCE', $carrier->id);
+
+        return true;
+    }
+
+    /**
+     * Deletes a shipping method
+     */
+    /**
+     * Carrier logo size in px. Logos are displayed in natural size by some themes
+     * (e.g. PS 9 default theme Hummingbird), so source image must not be copied as is.
+     */
+    const CARRIER_LOGO_SIZE = 50;
+
+    /**
+     * Saves resized carrier logo
+     *
+     * @param int $id_carrier
+     * @param string $image_path Source image
+     *
+     * @return bool
+     */
+    public function setCarrierLogo($id_carrier, $image_path)
+    {
+        if (!$id_carrier || !file_exists($image_path)) {
+            return false;
+        }
+
+        $destination = _PS_SHIP_IMG_DIR_ . (int) $id_carrier . '.jpg';
+        $result = ImageManager::resize($image_path, $destination, self::CARRIER_LOGO_SIZE, self::CARRIER_LOGO_SIZE);
+        if (!$result) {
+            $result = copy($image_path, $destination);
+        }
+
+        // Remove cached BO thumbnails
+        foreach (glob(_PS_TMP_IMG_DIR_ . 'carrier_mini_' . (int) $id_carrier . '_*.jpg') ?: [] as $tmp_file) {
+            @unlink($tmp_file);
+        }
+
+        return (bool) $result;
+    }
+
+    /**
+     * Resizes logos of existing module carriers, which were copied in original size by older module versions
+     *
+     * @return bool
+     */
+    public function fixCarrierLogos()
+    {
+        foreach (self::$_carriers as $carrier_info) {
+            $reference = Configuration::get($carrier_info['reference_name']);
+            if (!$reference) {
+                continue;
+            }
+            $carrier = Carrier::getCarrierByReference($reference);
+            if (!Validate::isLoadedObject($carrier)) {
+                continue;
+            }
+
+            $logo = _PS_SHIP_IMG_DIR_ . (int) $carrier->id . '.jpg';
+            $size = file_exists($logo) ? @getimagesize($logo) : false;
+            if (!$size || $size[0] <= self::CARRIER_LOGO_SIZE * 2) {
+                continue; // no logo, custom or already resized logo - keep it
+            }
+
+            $this->setCarrierLogo($carrier->id, self::$_moduleDir . 'views/images/' . $carrier_info['image']);
+        }
+
+        return true;
+    }
+
+    public function deleteCarrier($key)
+    {
+        $carrier = new Carrier((int) (Configuration::get($key)));
+        if (!$carrier || !Validate::isLoadedObject($carrier)) {
+            return true; // carrier doesnt exist, no further action needed
+        }
+
+        if (Configuration::get('PS_CARRIER_DEFAULT') == (int) $carrier->id) {
+            $this->updateDefaultCarrier();
+        }
+
+        $carrier->active = 0;
+        $carrier->deleted = 1;
+
+        if (!$carrier->update()) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Change default carrier when deleting carrier
+     */
+    private function updateDefaultCarrier()
+    {
+        $cHelper = new MjvpHelper();
+
+        $carriers = $cHelper->getAllCarriers();
+        foreach ($carriers as $carrier) {
+            if ($carrier['external_module_name'] != $this->name && $carrier['active'] && !$carrier['deleted']) {
+                Configuration::updateValue('PS_CARRIER_DEFAULT', $carrier['id_carrier']);
+                break;
+            }
+        }
+    }
+
+    /**
+     * Create other configuration values in database
+     */
+    private function createOtherDbRecords()
+    {
+        foreach ($this->_configKeysOther as $item => $data ) {
+            $data_value = (is_array($data['default_value'])) ? json_encode($data['default_value']) : $data['default_value'];
+            if (!Configuration::hasKey($data['key'])) {
+                Configuration::updateValue($data['key'], $data_value);
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Get terminals for all countries
+     */
+    private function updateTerminals()
+    {
+        $cFiles = new MjvpFiles();
+        $cFiles->updateCountriesList();
+        $cFiles->updateTerminalsList();
+    }
+
+    /**
+     * Function for hooks control
+     */
+    public function setHooks($action = 'register')
+    {
+        $allowed_actions = array('register', 'unregister');
+        if (!in_array($action, $allowed_actions)) {
+            $msg = "Unsupported hook action - allowed only ";
+            $first = true;
+            foreach ($allowed_actions as $act) {
+                if (!$first) {
+                    $msg .= ', ';
+                } else {
+                    $first = false;
+                }
+                $msg .= "'" . $act . "'";
+            }
+            throw new Exception($msg);
+        }
+        $action .= 'Hook';
+        foreach ($this->getHooksList() as $hook) {
+            if (!$this->$action($hook)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Returns hooks list for current PrestaShop version
+     *
+     * @return string[]
+     */
+    public function getHooksList()
+    {
+        $hooks = $this->_hooks;
+
+        if (version_compare(_PS_VERSION_, '1.7.7', '>=')) {
+            $hooks = array_merge($hooks, $this->_hooksSymfonyOrders);
+        } else {
+            $hooks = array_merge($hooks, $this->_hooksLegacyOrders);
+        }
+
+        if (version_compare(_PS_VERSION_, '1.7', '<')) {
+            $hooks = array_merge($hooks, $this->_hooksPs16);
+        }
+
+        return $hooks;
+    }
+
+    /**
+     * Hooks which should not be registered on current PrestaShop version
+     *
+     * @return string[]
+     */
+    public function getUnusedHooksList()
+    {
+        $all_hooks = array_merge(
+            $this->_obsoleteHooks,
+            $this->_hooksSymfonyOrders,
+            $this->_hooksLegacyOrders,
+            $this->_hooksPs16
+        );
+
+        return array_values(array_diff($all_hooks, $this->getHooksList()));
+    }
+
+    /**
+     * Removes obsolete/alias hooks and registers hooks needed for current PS version.
+     * Used on module upgrade.
+     *
+     * @return bool
+     */
+    public function syncHooks()
+    {
+        foreach ($this->getUnusedHooksList() as $hook) {
+            // Returns false when module is not hooked - that is fine
+            $this->unregisterHook($hook);
+        }
+
+        // Register after unregister - on older PS unregistering an alias could remove the canonical hook too.
+        // registerHook() skips shops where module is already hooked.
+        $result = true;
+        foreach ($this->getHooksList() as $hook) {
+            $result = $this->registerHook($hook) && $result;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Create module database tables
+     */
+    public function createDbTables()
+    {
+        try {
+            $cDb = new MjvpDb();
+
+            $result = $cDb->createTables();
+        } catch (Exception $e) {
+            $result = false;
+        }
+        return $result;
+    }
+
+    /**
+     * Load the configuration form
+     */
+    public function getContent()
+    {
+        $output = null;
+
+        if (Tools::isSubmit('submit' . $this->name . 'api')) {
+            $output .= $this->saveConfig('API', $this->l('API settings updated'));
+        }
+        if (Tools::isSubmit('submit' . $this->name . 'shop')) {
+            $output .= $this->saveConfig('SHOP', $this->l('Shop settings updated'));
+        }
+        if (Tools::isSubmit('submit' . $this->name . 'pickuppoints')) {
+            $output .= $this->saveConfig('PICKUPPOINTS', $this->l('Pickup points settings updated'));
+        }
+        if (Tools::isSubmit('submit' . $this->name . 'courier')) {
+            $output .= $this->saveConfig('COURIER', $this->l('Courier settings updated'));
+        }
+        if (Tools::isSubmit('submit' . $this->name . 'label')) {
+            $output .= $this->saveConfig('LABEL', $this->l('Labels settings updated'));
+        }
+        if (Tools::isSubmit('submit' . $this->name . 'advanced')) {
+            $output .= $this->saveConfig('ADVANCED', $this->l('Advanced settings updated'));
+        }
+
+        return $output
+            . $this->displayConfigApi()
+            . $this->displayConfigShop()
+            . $this->displayConfigCourier()
+            . $this->displayConfigLabel()
+            . $this->displayConfigAdvancedSettings();
+    }
+
+    /**
+     * Display menu in module configuration
+     */
+    public function displayConfigMenu()
+    {
+        $menu = array(
+            array(
+                'label' => $this->l('Module settings'),
+                'url' => $this->context->link->getAdminLink('AdminModules') . '&configure=' . $this->name,
+                'active' => Tools::getValue('controller') == 'AdminModules'
+            ),
+        );
+
+        $this->context->smarty->assign(array(
+            'moduleMenu' => $menu
+        ));
+
+        return $this->context->smarty->fetch(self::$_moduleDir . 'views/templates/admin/configs_menu.tpl');
+    }
+
+    /**
+     * Display API section in module configuration
+     */
+    public function displayConfigApi()
+    {
+        $cModuleConfig = new MjvpModuleConfig();
+
+        $section_id = 'API';
+
+        $switcher_values = array(
+            array(
+                'id' => 'active_on',
+                'value' => 1,
+                'label' => $this->l('Yes')
+            ),
+            array(
+                'id' => 'active_off',
+                'value' => 0,
+                'label' => $this->l('No')
+            )
+        );
+
+        $form_fields = array(
+            array(
+                'type' => 'text',
+                'label' => $this->l('API username'),
+                'name' => $cModuleConfig->getConfigKey('username', $section_id),
+                'size' => 20,
+                'required' => true
+            ),
+            array(
+                'type' => 'text',
+                'label' => $this->l('API password'),
+                'name' => $cModuleConfig->getConfigKey('password', $section_id),
+                'size' => 20,
+                'required' => true
+            ),
+            array(
+                'type' => 'text',
+                'label' => $this->l('API ID'),
+                'name' => $cModuleConfig->getConfigKey('id', $section_id),
+                'size' => 20,
+                'required' => true
+            ),
+            array(
+                'type' => 'switch',
+                'label' => $this->l('Live mode'),
+                'name' => $cModuleConfig->getConfigKey('live_mode', $section_id),
+                'desc' => $this->l('Use this mode if you have Live API credentials. If you have test credentials, disable this option.'),
+                'values' => $switcher_values
+            ),
+            array(
+                'type' => 'text',
+                'label' => $this->l('Live API Server'),
+                'name' => $cModuleConfig->getConfigKey('live_api_server', $section_id),
+                'desc' => [
+                    [
+                        'text' => $this->l('Do not edit this field, unless Venipak has changed their Live API server URL!'),
+                        'id' => 'live-endpoint-desc',
+                    ]
+                ]
+            ),
+            array(
+                'type' => 'text',
+                'label' => $this->l('Test API Server'),
+                'name' => $cModuleConfig->getConfigKey('test_api_server', $section_id),
+                'desc' => [
+                    [
+                        'text' => $this->l('Do not edit this field, unless Venipak has changed their Test API server URL!'),
+                        'id' => 'test-endpoint-desc',
+                    ]
+                ]
+            ),
+        );
+
+        return $this->displayConfig($section_id, $this->l('API Settings'), $form_fields, $this->l('Save API settings'));
+    }
+
+    /**
+     * Display Shop section in module configuration
+     */
+    public function displayConfigShop()
+    {
+        $cModuleConfig = new MjvpModuleConfig();
+
+        $section_id = 'SHOP';
+        $country_options = [];
+
+        foreach ($this->available_countries as $country) {
+            if (isset($this->countries_names[$country])) {
+                array_push($country_options, array(
+                    'id_option' => $country,
+                    'name' => $country . ' - ' . $this->countries_names[$country]
+                ));
+            }
+        }
+
+        $switcher_values = array(
+            array(
+                'id' => 'active_on',
+                'value' => 1,
+                'label' => $this->l('Yes')
+            ),
+            array(
+                'id' => 'active_off',
+                'value' => 0,
+                'label' => $this->l('No')
+            )
+        );
+
+        $form_fields = array(
+            array(
+                'type' => 'text',
+                'label' => $this->l('Sender Name'),
+                'name' => $cModuleConfig->getConfigKey('sender_name', $section_id),
+                'size' => 20,
+                'required' => true
+            ),
+            array(
+                'type' => 'text',
+                'label' => $this->l('Company code'),
+                'name' => $cModuleConfig->getConfigKey('company_code', $section_id),
+                'size' => 20,
+                'required' => true
+            ),
+            array(
+                'type' => 'text',
+                'label' => $this->l('Address'),
+                'name' => $cModuleConfig->getConfigKey('shop_address', $section_id),
+                'size' => 20,
+                'required' => true
+            ),
+            array(
+                'type' => 'text',
+                'label' => $this->l('City'),
+                'name' => $cModuleConfig->getConfigKey('shop_city', $section_id),
+                'size' => 20,
+                'required' => true
+            ),
+            array(
+                'type' => 'select',
+                'label' => $this->l('Country Code'),
+                'name' => $cModuleConfig->getConfigKey('shop_country_code', $section_id),
+                'options' => array(
+                    'query' => $country_options,
+                    'id' => 'id_option',
+                    'name' => 'name'
+                ),
+                'required' => true
+            ),
+            array(
+                'type' => 'text',
+                'label' => $this->l('Postcode'),
+                'name' => $cModuleConfig->getConfigKey('shop_postcode', $section_id),
+                'size' => 20,
+                'required' => true
+            ),
+            array(
+                'type' => 'text',
+                'label' => $this->l('Contact person'),
+                'name' => $cModuleConfig->getConfigKey('shop_contact', $section_id),
+                'size' => 20,
+                'required' => true
+            ),
+            array(
+                'type' => 'text',
+                'label' => $this->l('Mob. Phone'),
+                'name' => $cModuleConfig->getConfigKey('shop_phone', $section_id),
+                'size' => 20,
+                'required' => true
+            ),
+            array(
+                'type' => 'text',
+                'label' => $this->l('Email'),
+                'name' => $cModuleConfig->getConfigKey('shop_email', $section_id),
+                'size' => 20,
+                'required' => true
+            ),
+            array(
+                'type' => 'switch',
+                'label' => $this->l('Use as sender\'s address.'),
+                'name' => $cModuleConfig->getConfigKey('sender_address', $section_id),
+                'desc' => $this->l('Use shop settings as sender\'s address. Otherwise inforamtion from your Venipak account will be used.'),
+                'values' => $switcher_values
+            ),
+        );
+
+        return $this->displayConfig($section_id, $this->l('Shop Settings'), $form_fields, $this->l('Save shop settings'));
+    }
+
+    /**
+     * Display Courier section in module configuration
+     */
+    public function displayConfigCourier()
+    {
+        $cModuleConfig = new MjvpModuleConfig();
+
+        $section_id = 'COURIER';
+
+        $switcher_values = array(
+            array(
+                'id' => 'active_on',
+                'value' => 1,
+                'label' => $this->l('Yes')
+            ),
+            array(
+                'id' => 'active_off',
+                'value' => 0,
+                'label' => $this->l('No')
+            )
+        );
+
+        $form_fields = array(
+            array(
+                'type' => 'switch',
+                'label' => $this->l('Door code'),
+                'name' => $cModuleConfig->getConfigKey('door_code', $section_id),
+                'desc' => $this->l('Add input for customers to enter their door code, when selected courier.'),
+                'values' => $switcher_values
+            ),
+            array(
+                'type' => 'switch',
+                'label' => $this->l('Cabinet number'),
+                'name' => $cModuleConfig->getConfigKey('cabinet_number', $section_id),
+                'desc' => $this->l('Allow customers to input cabinet number.'),
+                'values' => $switcher_values
+            ),
+            array(
+                'type' => 'switch',
+                'label' => $this->l('Warehouse number'),
+                'name' => $cModuleConfig->getConfigKey('warehouse_number', $section_id),
+                'desc' => $this->l('Allow customers to select warehouse.'),
+                'values' => $switcher_values
+            ),
+            array(
+                'type' => 'switch',
+                'label' => $this->l('Enable carrier call before delivery'),
+                'name' => $cModuleConfig->getConfigKey('call_before_delivery', $section_id),
+                'desc' => $this->l('Enable this option, if you want courier to call a consignee before shipment delivery'),
+                'values' => $switcher_values
+            ),
+            array(
+                'type' => 'switch',
+                'label' => $this->l('Enable return service'),
+                'name' => $cModuleConfig->getConfigKey('return_service', $section_id),
+                'desc' => $this->l('Enable this option, if you want to enable return service for shipments.'),
+                'values' => $switcher_values
+            ),
+            array(
+                'type' => 'text',
+                'label' => $this->l('Return days'),
+                'name' => $cModuleConfig->getConfigKey('return_days', $section_id),
+                'class' => 'input fixed-width-xl',
+                'maxlength' => 3,
+                'form_group_class' => 'return-days hide',
+            ),
+            array(
+                'type' => 'switch',
+                'label' => $this->l('Enable delivery time selection'),
+                'name' => $cModuleConfig->getConfigKey('delivery_time', $section_id),
+                'desc' => $this->l('Allow customers to select delivery time.'),
+                'values' => $switcher_values
+            ),
+        );
+        $form_fields = array_merge($form_fields, $this->getDeliveryTimeSelectionFormFields());
+
+        return $this->displayConfig($section_id, $this->l('Courier Settings'), $form_fields, $this->l('Save courier settings'));
+    }
+
+    public function getDeliveryTimeSelectionFormFields()
+    {
+        $form_fields = [];
+        $label = $this->l('Enable/Disable delivery times');
+        foreach ($this->deliveryTimes as $key => $deliveryTime)
+        {
+
+            $config_key = $this->_configKeys['COURIER']['delivery_time_' . $key];
+            $form_fields[] = [
+                'type' => 'checkbox',
+                'name' => $config_key,
+                'label' => $label,
+                'form_group_class' => 'delivery-checkbox hide',
+                'values' => [
+                    'query' => [
+                        [
+                            'id' => 'ON',
+                            'name' => $deliveryTime,
+                            'val' => '1',
+                        ],
+                    ],
+                    'id' => 'id',
+                    'name' => 'name',
+                ],
+            ];
+            $label = '';
+        }
+
+        return $form_fields;
+    }
+
+
+
+    /**
+     * Display Advanced settings section in module configuration
+     */
+    public function displayConfigAdvancedSettings()
+    {
+        $cModuleConfig = new MjvpModuleConfig();
+
+        $section_id = 'ADVANCED';
+
+        $pickup_point_types = array(
+            array(
+                'id' => '1',
+                'name' => $this->l('Pickups'),
+            ),
+            array(
+                'id' => '3',
+                'name' => $this->l('Lockers'),
+            ),
+        );
+
+        $form_fields = array(
+            array(
+                'type' => 'text',
+                'label' => $this->l('Carrier disable passphrase'),
+                'name' => $cModuleConfig->getConfigKey('carrier_disable_passphrase', $section_id),
+                'desc' => $this->l('Carriers will not be used for the cart, if cart contains any product, whose description contains this passphrase.'),
+            ),
+            array(
+                'type' => 'checkbox',
+                'label' => $this->l('Pickup point types on checkout'),
+                'name' => $cModuleConfig->getConfigKey('pickup_point_types', $section_id),
+                'desc' => $this->l('Select which pickup point types to show on checkout page.'),
+                'values' => array(
+                    'query' => $pickup_point_types,
+                    'id' => 'id',
+                    'name' => 'name',
+                ),
+            ),
+        );
+
+        return $this->displayConfig($section_id, $this->l('Advanced settings'), $form_fields, $this->l('Save Advanced settings'));
+    }
+
+    /**
+     * Display Labels section in module configuration
+     */
+    public function displayConfigLabel()
+    {
+        $cModuleConfig = new MjvpModuleConfig();
+
+        $section_id = 'LABEL';
+
+        $form_fields = array(
+            array(
+                'type' => 'radio',
+                'label' => $this->l('Label size'),
+                'name' => $cModuleConfig->getConfigKey('label_size', $section_id),
+                'values' => array(
+                    array(
+                        'id' => 'A4',
+                        'value' => 'a4',
+                        'label' => 'A4',
+                    ),
+                    array(
+                        'id' => '100 X 150',
+                        'value' => '100x150',
+                        'label' => '100 X 150',
+                    ),
+                ),
+                'desc' => $this->l('Paper size of printing labels'),
+            ),
+            array(
+                'type' => 'text',
+                'label' => $this->l('Last pack number'),
+                'name' => $cModuleConfig->getConfigKey('label_counter', $section_id),
+                'size' => 20,
+                'required' => false,
+                'desc' => $this->l('This field allows to change the last package number that is included in the label code (label code always must be unique)') . '. ' . sprintf($this->l('This value must be a number and not longer than %u characters'), 7) . '.',
+                //'disabled' => true,
+            ),
+        );
+
+        return $this->displayConfig($section_id, $this->l('Labels Settings'), $form_fields, $this->l('Save labels settings'));
+    }
+
+    /**
+     * Display Pickup points section in module configuration
+     */
+    public function displayConfigPickupPoints()
+    {
+        $section_id = 'PICKUPPOINTS';
+
+        $country_options = array(
+        );
+
+        $form_fields = array(
+        );
+
+        return $this->displayConfig($section_id, $this->l('Pickup points'), $form_fields, $this->l('Save pickup points settings'));
+    }
+
+    /**
+     * Build section display in module configuration
+     */
+    public function displayConfig($section_id, $section_title, $form_fields = array(), $submit_title = '')
+    {
+        $fieldsForm[0]['form'] = array(
+            'legend' => array(
+                'title' => $section_title,
+            ),
+            'input' => $form_fields,
+            'submit' => array(
+                'title' => (!empty($submit_title)) ? $submit_title : $this->l('Save'),
+                'class' => 'btn btn-default pull-right'
+            ),
+        );
+
+        $helper = new HelperForm();
+
+        // Module, token and currentIndex
+        $helper->module = $this;
+        $helper->bootstrap = true;
+        $helper->name_controller = $this->name;
+        $helper->token = Tools::getAdminTokenLite('AdminModules');
+        $helper->currentIndex = AdminController::$currentIndex . '&configure=' . $this->name;
+
+        // Title and toolbar
+        $helper->title = $this->displayName;
+        $helper->show_toolbar = true;        // false -> remove toolbar
+        $helper->toolbar_scroll = true;      // yes - > Toolbar is always visible on the top of the screen.
+        $helper->submit_action = 'submit' . $this->name . strtolower($section_id);
+        $helper->toolbar_btn = array(
+            'save' => array(
+                'desc' => $this->l('Save'),
+                'href' => AdminController::$currentIndex . '&configure=' . $this->name . '&save' . $this->name .
+                    '&token=' . Tools::getAdminTokenLite('AdminModules'),
+            ),
+            'back' => array(
+                'href' => AdminController::$currentIndex . '&token=' . Tools::getAdminTokenLite('AdminModules'),
+                'desc' => $this->l('Back to list')
+            )
+        );
+
+        // Load saved settings
+        if (isset($this->_configKeys[strtoupper($section_id)])) {
+            foreach ($this->_configKeys[strtoupper($section_id)] as $key) {
+                $prefix = '';
+                if(strpos($key, 'MJVP_COURIER_DELIVERY_TIME_') !== false)
+                    $prefix = '_ON';
+
+                // Handle checkbox type (pickup point types)
+                if ($key == 'MJVP_PICKUP_POINT_TYPES') {
+                    $saved_types = Configuration::get($key);
+                    if ($saved_types === false) {
+                        $saved_types = '1,3'; // default: all types enabled
+                    }
+                    $enabled_types = explode(',', $saved_types);
+                    foreach ($enabled_types as $type_id) {
+                        $helper->fields_value[$key . '_' . $type_id] = true;
+                    }
+                    continue;
+                }
+
+                // For multistore: global-only keys always load from global scope
+                if (Shop::isFeatureActive() && !in_array($key, self::$_multistoreKeys)) {
+                    $value = Configuration::getGlobalValue($key);
+                } else {
+                    $value = Configuration::get($key);
+                }
+                if($key == $this->_configKeys['COURIER']['return_days'] && !$value)
+                    $value = self::RETURN_DAYS_DEFAULT;
+                $helper->fields_value[$key . $prefix] = $value;
+            }
+        }
+
+        return $helper->generateForm($fieldsForm);
+    }
+
+    /**
+     * Save section values in module configuration
+     */
+    public function saveConfig($section_id, $success_message = '')
+    {
+        $errors = $this->validateConfig($section_id);
+        $output = null;
+
+        if (!empty($errors)) {
+            $output .= $this->displayError($errors);
+        } else {
+            foreach ($this->_configKeys[strtoupper($section_id)] as $key) {
+
+                // Handle checkbox type (pickup point types)
+                if ($key == 'MJVP_PICKUP_POINT_TYPES') {
+                    $selected_types = array();
+                    foreach ($_POST as $post_key => $post_value) {
+                        if (strpos($post_key, 'MJVP_PICKUP_POINT_TYPES_') === 0) {
+                            $selected_types[] = str_replace('MJVP_PICKUP_POINT_TYPES_', '', $post_key);
+                        }
+                    }
+                    Configuration::updateValue($key, implode(',', $selected_types));
+                    continue;
+                }
+
+                if(strpos($key, 'MJVP_COURIER_DELIVERY_TIME_') !== false)
+                    $value = Tools::getValue($key . '_ON');
+                else
+                    $value = Tools::getValue($key);
+
+                if (is_array($value)) {
+                    $value = implode(';', $value);
+                }
+
+                // For multistore: global-only keys always save to global scope
+                if (Shop::isFeatureActive() && !in_array($key, self::$_multistoreKeys)) {
+                    Configuration::updateGlobalValue($key, strval($value));
+                } else {
+                    Configuration::updateValue($key, strval($value));
+                }
+            }
+            $success_message = (!empty($success_message)) ? $success_message : $this->l('Settings updated');
+            $output .= $this->displayConfirmation($success_message);
+        }
+
+        return $output;
+    }
+
+    /**
+     * Validate section values in module configuration
+     */
+    protected function validateConfig($section_id)
+    {
+        $cModuleConfig = new MjvpModuleConfig();
+
+        $section_id = strtoupper($section_id);
+
+        $errors = array();
+        $txt_required = $this->l('is required');
+
+        if ($section_id == 'API') {
+            if (empty(Tools::getValue($cModuleConfig->getConfigKey('username', 'API')))) {
+                $errors[] = $this->l('API username') . ' ' . $txt_required;
+            }
+            if (empty(Tools::getValue($cModuleConfig->getConfigKey('password', 'API')))) {
+                $errors[] = $this->l('API password') . ' ' . $txt_required;
+            }
+            if (empty(Tools::getValue($cModuleConfig->getConfigKey('id', 'API')))) {
+                $errors[] = $this->l('API ID') . ' ' . $txt_required;
+            }
+        }
+        if ($section_id == 'SHOP') {
+            foreach ($this->_configKeys[$section_id] as $key => $key_value) {
+                $configField = $this->getConfigField($section_id, $key);
+                if (empty(Tools::getValue($cModuleConfig->getConfigKey($key, 'SHOP'))) && $configField['required']) {
+                    $errors[] = $configField['name'] . ' ' . $txt_required;
+                }
+            }
+        }
+        if ($section_id == 'LABEL') {
+            foreach ($this->_configKeys[$section_id] as $key => $key_value) {
+                $configField = $this->getConfigField($section_id, $key_value);
+                $field_value = Tools::getValue($cModuleConfig->getConfigKey($key, $section_id));
+                if (isset($configField['type']) && $configField['type'] === 'number') {
+                    $field_value = (float) $field_value;
+                    if (isset($configField['min']) && $field_value < $configField['min']) {
+                        $errors[] = sprintf($this->l('%s must be more then %d'), $configField['name'], $configField['min']);
+                    }
+                    if (isset($configField['max']) && $field_value > $configField['max']) {
+                        $errors[] = sprintf($this->l('%s must be less then %d'), $configField['name'], $configField['max']);
+                    }
+                }
+            }
+        }
+
+        if ($section_id == 'ADVANCED') {
+            foreach ($this->_configKeys[$section_id] as $key => $key_value) {
+                $configField = $this->getConfigField($section_id, $key_value);
+                $field_value = Tools::getValue($cModuleConfig->getConfigKey($key, $section_id));
+                if (isset($configField['validate'])) {
+                    $validate = $configField['validate'];
+                    if(!Validate::$validate($field_value))
+                    {
+                        $errors[] = sprintf($this->l('%s is not valid.'), $configField['name']);
+                    }
+                }
+            }
+        }
+
+        if ($section_id == 'COURIER') {
+            if(Tools::getValue('MJVP_RETURN_DAYS') && !Validate::isInt(Tools::getValue('MJVP_RETURN_DAYS')))
+            {
+                $errors[] = sprintf($this->l('Return days must be a positive number.'));
+            }
+        }
+
+        return $errors;
+    }
+
+    /**
+     * Update default carrier
+     */
+    public function hookActionCarrierUpdate($params)
+    {
+        if (!isset($params['id_carrier'], $params['carrier']) || !is_object($params['carrier'])) {
+            return;
+        }
+
+        $id_carrier_old = (int) $params['id_carrier'];
+        $id_carrier_new = (int) $params['carrier']->id;
+
+        foreach (self::$_carriers as $carrier) {
+            if ($id_carrier_old == (int) Configuration::get($carrier['id_name'])) {
+                Configuration::updateValue($carrier['id_name'], $id_carrier_new);
+            }
+        }
+    }
+
+    /**
+     * @deprecated alias hook, kept for backward compatibility. Use hookActionCarrierUpdate
+     */
+    public function hookUpdateCarrier($params)
+    {
+        $this->hookActionCarrierUpdate($params);
+    }
+
+    /**
+     * @deprecated alias hook, kept for backward compatibility. Use hookDisplayHeader
+     */
+    public function hookHeader($params)
+    {
+        return $this->hookDisplayHeader($params);
+    }
+
+    /**
+     * Prevents double header execution when module is still hooked to both "header" alias and "displayHeader"
+     * (installations upgraded from older module versions)
+     */
+    private static $_headerProcessed = false;
+
+    /**
+     * Hook for js/css files and other elements in header
+     */
+    public function hookDisplayHeader($params)
+    {
+        if (self::$_headerProcessed) {
+            return;
+        }
+        self::$_headerProcessed = true;
+
+        $this->updateTerminals();
+        if (!$this->active) return;
+
+        if(version_compare(_PS_VERSION_, '1.7', '>='))
+        {
+            $add_content = $this->context->controller->php_self == 'order' && !$this->check17PaymentStep($this->context->cart);
+        }
+        // 1.6
+        else
+        {
+            $add_content = ($this->context->controller->php_self == 'order' && isset($this->context->controller->step) && $this->context->controller->step != 3) ||  $this->context->controller->php_self == 'order-opc';
+        }
+
+        if ($add_content)
+        {
+
+            $address = new Address($params['cart']->id_address_delivery);
+            $filtered_terminals = $this->getFilteredTerminals();
+
+            if (!is_array($filtered_terminals) || empty($filtered_terminals)) {
+                $cHelper = new MjvpHelper();
+                $cHelper->writeToLog(
+                    'Pickup carrier hidden on checkout: terminal list is '
+                    . (is_array($filtered_terminals) ? 'empty after filtering invalid entries' : 'not a valid array')
+                    . '. Cart ID: ' . $params['cart']->id,
+                    'terminals'
+                );
+                $filtered_terminals = [];
+            }
+
+            $this->terminal_count = count($filtered_terminals);
+
+            $address_query = $address->address1 . ' ' . $address->postcode . ', ' . $address->city;
+            Media::addJsDef(array(
+                    'mjvp_front_controller_url' => $this->context->link->getModuleLink($this->name, 'front'),
+                    'mjvp_carriers_controller_url' => $this->context->link->getModuleLink($this->name, 'carriers'),
+                    'address_query' => $address_query,
+                    'mjvp_translates' => array(
+                        'loading' => $this->l('Loading'),
+                    ),
+                    'images_url' => $this->_path . 'views/images/',
+                    'mjvp_terminal_select_translates' => array(
+                    'modal_header' => $this->l('Pickup points map'),
+                    'terminal_list_header' => $this->l('Pickup points list'),
+                    'seach_header' => $this->l('Search around'),
+                    'search_btn' => $this->l('Find'),
+                    'modal_open_btn' => $this->l('Select a pickup point'),
+                    'geolocation_btn' => $this->l('Use my location'),
+                    'your_position' => $this->l('Distance calculated from this point'),
+                    'nothing_found' => $this->l('Nothing found'),
+                    'no_cities_found' => $this->l('There were no cities found for your search term'),
+                    'geolocation_not_supported' => $this->l('Geolocation is not supported'),
+                    'select_pickup_point' => $this->l('Select a pickup point'),
+                    'search_placeholder' => $this->l('Enter postcode/address'),
+                    'workhours_header' => $this->l('Workhours'),
+                    'contacts_header' => $this->l('Contacts'),
+                    'no_pickup_points' => $this->l('No points to select'),
+                    'select_btn' => $this->l('select'),
+                    'back_to_list_btn' => $this->l('reset search'),
+                    'no_information' => $this->l('No information'),
+                    ),
+                    'mjvp_terminals' => $filtered_terminals,
+                    'mjvp_allowed_pickup_types' => $this->getAllowedPickupTypes(),
+                    'mjvp_pickup_carrier_id' => (int) Carrier::getCarrierByReference(Configuration::get(self::$_carriers['pickup']['reference_name']))->id,
+                    'mjvp_courier_carrier_id' => (int) Carrier::getCarrierByReference(Configuration::get(self::$_carriers['courier']['reference_name']))->id,
+                )
+            );
+            // 1.7
+            if(version_compare(_PS_VERSION_, '1.7', '>='))
+            {
+                $this->context->smarty->assign(
+                    ['images_url' => $this->_path . 'views/images/',
+                     'mjvp_allowed_pickup_types' => $this->getAllowedPickupTypes()]
+                );
+                Media::addJsDef([
+                        'mjvp_map_template' => $this->context->smarty->fetch(self::$_moduleDir . 'views/templates/front/map-template.tpl'),
+                    ]
+                );
+                $this->context->controller->registerJavascript('modules-mjvp-terminals-mapping-js', 'modules/' . $this->name . '/views/js/terminal-mapping.js');
+                $this->context->controller->registerJavascript('modules-mjvp-front-js', 'modules/' . $this->name . '/views/js/front17.js');
+                $this->context->controller->registerJavascript('modules-mjvp-terminals-mapinit-js', 'modules/' . $this->name . '/views/js/terminals_map_init.js');
+            }
+            // 1.6
+            else
+            {
+
+                $this->context->controller->addJS('modules/' . $this->name . '/views/js/terminal-mapping.js');
+                $this->context->controller->addJS('modules/' . $this->name . '/views/js/front16.js');
+                $this->context->controller->addJS('modules/' . $this->name . '/views/js/terminals_map_init.js');
+            }
+
+            $this->context->controller->addCSS($this->_path . 'views/css/global.css');
+            $this->context->controller->addCSS($this->_path . 'views/css/three-dots.min.css');
+            $this->context->controller->addCSS($this->_path . 'views/css/terminal-mapping.css');
+        }
+    }
+
+    /**
+     * Hook to display block in Prestashop order view (PS 1.7.7+, 8.x, 9.x) - main (right) column
+     */
+    public function hookDisplayAdminOrderMain($params)
+    {
+        return $this->renderAdminOrderBlock($params);
+    }
+
+    /**
+     * Hook to display block in Prestashop order view (PS < 1.7.7)
+     */
+    public function hookDisplayAdminOrder($params)
+    {
+        // On PS 1.7.7+ block is displayed via displayAdminOrderMain. Avoid double rendering,
+        // if module is still hooked to displayAdminOrder after upgrade.
+        if (version_compare(_PS_VERSION_, '1.7.7', '>=')) {
+            return '';
+        }
+
+        return $this->renderAdminOrderBlock($params);
+    }
+
+    /**
+     * Render Venipak block in Prestashop order view
+     */
+    private function renderAdminOrderBlock($params)
+    {
+        if (empty($params['id_order'])) {
+            return '';
+        }
+
+        $order_id = (int)$params['id_order'];
+        $order = new Order($order_id);
+
+        if (!is_object($order) || !isset($order->id_cart)) {
+            return '';
+        }
+
+        $cDb = new MjvpDb();
+        $cHelper = new MjvpHelper();
+
+        try {
+            $carrier = new Carrier($order->id_carrier);
+            if (!$cHelper->itIsThisModuleCarrier($carrier->id_reference)) {
+                return '';
+            }
+
+            $status = $cDb->getOrderValue('status', array('id_cart' => $order->id_cart));
+            $error = $cDb->getOrderValue('error', array('id_cart' => $order->id_cart));
+            $tracking_numbers = $cDb->getOrderValue('labels_numbers', array('id_cart' => $order->id_cart));
+        } catch (Exception $e) {
+            $this->context->controller->errors[] = $this->displayName . " error:<br/>" . $e->getMessage();
+            return '';
+        }
+
+        $venipak_cart_info = $cDb->getOrderInfo($order->id);
+        $order_country_code = $venipak_cart_info['country_code'];
+        $cFiles = new MjvpFiles();
+        $pickup_points = $cFiles->getTerminalsListForCountry($order_country_code, false);
+        if(!$pickup_points)
+            $pickup_points = [];
+
+        $this->createVenipakOrderIfNotExists($order);
+        $order_terminal_id = $cDb->getOrderValue('terminal_id', ['id_order' => $order->id]);
+        $venipak_carriers = [];
+        foreach (self::$_carriers as $carrier)
+        {
+            $reference = Configuration::get($carrier['reference_name']);
+            $carrier = Carrier::getCarrierByReference($reference);
+            $venipak_carriers[$reference] = $carrier->name;
+        }
+
+        $order_carrier_reference = $venipak_cart_info['id_carrier_ref'];
+        if($order_carrier_reference == Configuration::get(self::$_carriers['pickup']['reference_name']))
+            $venipak_cart_info['is_pickup'] = true;
+
+        $other_info = json_decode($venipak_cart_info['other_info'], true);
+        $shipment_labels = json_decode($venipak_cart_info['labels_numbers'], true);
+
+        $warehouses = MjvpWarehouse::getWarehouses();
+        $order_warehouse = $cDb->getOrderValue('warehouse_id', array('id_order' => $order->id));
+        if(!$order_warehouse)
+            $order_warehouse = MjvpWarehouse::getDefaultWarehouse();
+
+        $venipak_error = ($venipak_cart_info['error'] != '' ? $this->displayError($venipak_cart_info['error']) : false);
+        if (! is_array($pickup_points)) {
+            $error_txt = (is_string($pickup_points)) ? $pickup_points : $this->l('Failed to get terminals list');
+            $venipak_error = $this->displayError($error_txt);
+            $pickup_points = [];
+        }
+
+        $cModuleConfig = $this->getModuleService('MjvpModuleConfig');
+        $this->context->smarty->assign(array(
+            'block_title' => $this->displayName,
+            'return_service' => isset($other_info['return_service']) ? $other_info['return_service'] : Configuration::get($cModuleConfig->getConfigKey('return_service', 'COURIER')),
+            'module_dir' => __PS_BASE_URI__ . 'modules/' . $this->name,
+            'label_status' => $status,
+            'label_error' => $error,
+            'order_id' => $order->id,
+            'order_terminal_id' => $order_terminal_id,
+            'venipak_pickup_points' => $pickup_points,
+            'venipak_error' => $venipak_error,
+            'label_tracking_numbers' => json_decode($tracking_numbers),
+            'orderVenipakCartInfo' => $venipak_cart_info,
+            'venipak_carriers' => $venipak_carriers,
+            'venipak_other_info' => $other_info,
+            'warehouses' => $warehouses,
+            'order_warehouse' => $order_warehouse,
+            'shipment_labels' => $shipment_labels,
+            'delivery_times' => $this->deliveryTimes,
+            'carrier_reference' => $order_carrier_reference,
+            'pickup_reference' => Configuration::get(self::$_carriers['pickup']['reference_name']),
+            'venipak_print_label_url' => $this->context->link->getAdminLink('AdminVenipakshippingAjax') . '&action=printLabel',
+        ));
+
+        if(version_compare(_PS_VERSION_, '1.7.7', '<'))
+            return $this->context->smarty->fetch(self::$_moduleDir . 'views/templates/hook/displayAdminOrder.tpl');
+        return $this->context->smarty->fetch(self::$_moduleDir . 'views/templates/hook/displayAdminOrder177.tpl');
+
+    }
+
+    public function hookActionValidateStepComplete($params)
+    {
+        $cDb = new MjvpDb();
+        $errors = array();
+
+        // If it's not delivery step, Venipak carrier validation does not matter.
+        if($params['step_name'] != 'delivery')
+            return true;
+        $cart = $params['cart'];
+        $carrier = new Carrier($cart->id_carrier);
+        $carrier_reference = $carrier->id_reference;
+
+        if(Configuration::get(self::$_carriers['pickup']['reference_name']) == $carrier_reference)
+        {
+            // Check if terminal was selected
+            $terminal_id = $cDb->getOrderValue('terminal_id', array('id_cart' => $cart->id));
+            if(!$terminal_id)
+            {
+                // Only show errors when user is actively submitting the delivery step
+                $is_user_action = Tools::isSubmit('confirmDeliveryOption') || !empty($params['is_submit']);
+                if($is_user_action)
+                {
+                    $this->context->controller->errors[] = $this->l('Please select a terminal.');
+                }
+                $params['completed'] = false;
+                return false;
+            }
+        }
+        elseif (Configuration::get(self::$_carriers['courier']['reference_name']) == $carrier_reference && (
+            Tools::isSubmit('mjvp_door_code') ||
+            Tools::isSubmit('mjvp_cabinet_number') ||
+            Tools::isSubmit('mjvp_warehouse_number') ||
+            Tools::isSubmit('mjvp_delivery_time') ||
+            Tools::isSubmit('mjvp_carrier_call')
+        )) {
+            // Validate extra fields
+            $field_door_code = Tools::getValue('mjvp_door_code', '');
+            $field_cabinet_number = Tools::getValue('mjvp_cabinet_number', '');
+            $field_warehouse_number = Tools::getValue('mjvp_warehouse_number', '');
+            $field_delivery_time = Tools::getValue('mjvp_delivery_time', 'nwd');
+            $field_carrier_call = 0;
+            if(Tools::isSubmit('mjvp_carrier_call'))
+                $field_carrier_call = 1;
+            if(strlen($field_door_code) > self::EXTRA_FIELDS_SIZE)
+                $errors['mjvp_door_code'] = $this->l('The door code is too long.');
+            if(strlen($field_cabinet_number) > self::EXTRA_FIELDS_SIZE)
+                $errors['mjvp_cabinet_number'] = $this->l('The cabinet number is too long.');
+            if(strlen($field_warehouse_number) > self::EXTRA_FIELDS_SIZE)
+                $errors['mjvp_warehouse_number'] = $this->l('The warehouse number is too long.');
+            if(!isset($this->deliveryTimes[$field_delivery_time]))
+                $errors['mjvp_delivery_time'] = $this->l('Selected delivery time does not exist.');
+
+            if(!empty($errors))
+            {
+                // Only show errors when user is actively submitting the delivery step
+                $is_user_action = Tools::isSubmit('confirmDeliveryOption') || !empty($params['is_submit']);
+                if($is_user_action)
+                {
+                    foreach($errors as $error_msg)
+                    {
+                        $this->context->controller->errors[] = $error_msg;
+                    }
+                }
+                $params['completed'] = false;
+                return false;
+            }
+
+            $order_extra_info = self::$_order_additional_info;
+
+            $sql_extra_info = $cDb->getOrderValue('other_info', array('id_cart' => $cart->id));
+            $sql_extra_info = (array) json_decode($sql_extra_info);
+            foreach($sql_extra_info as $key => $value) {
+                $order_extra_info[$key] = $value;
+            }
+
+            $order_extra_info['door_code'] = $field_door_code;
+            $order_extra_info['cabinet_number'] = $field_cabinet_number;
+            $order_extra_info['warehouse_number'] = $field_warehouse_number;
+            $order_extra_info['delivery_time'] = $field_delivery_time;
+            $order_extra_info['carrier_call'] = $field_carrier_call;
+
+            $cDb->updateOrderInfo($cart->id, array('other_info' => json_encode($order_extra_info)));
+        }
+        return true;
+    }
+
+    // Separate method, as methods of gettign a checkout step on 1.7 are inconsistent among minor versions.
+    public function check17PaymentStep($cart)
+    {
+        if ($this->isActivedOnepageCheckoutModule()) {
+            return false;
+        }
+
+        if(version_compare(_PS_VERSION_, '1.7', '>'))
+        {
+            $rawData = Db::getInstance()->getValue(
+                'SELECT checkout_session_data FROM ' . _DB_PREFIX_ . 'cart WHERE id_cart = ' . (int) $cart->id
+            );
+            $data = json_decode($rawData, true);
+            if (!is_array($data)) {
+                $data = [];
+            }
+            // Do not add this module extra content, if it is payment step to avoid conflicts with venipakcod.
+            if((isset($data['checkout-delivery-step']) && $data['checkout-delivery-step']['step_is_complete']) &&
+                (isset($data['checkout-payment-step']) && !$data['checkout-payment-step']['step_is_complete'])
+            )
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public function isActivedOnepageCheckoutModule()
+    {
+        $onepage_modules = array('thecheckout');
+        
+        foreach ( $onepage_modules as $module_name ) {
+            $module = Module::getInstanceByName($module_name);
+            if ($module instanceof Module && $module->active) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Hook to display content on carrier in checkout page
+     */
+    public function hookDisplayCarrierExtraContent($params)
+    {
+        if($this->check17PaymentStep($params['cart']) && !isset($params['venipakcod']))
+            return '';
+        $cHelper = new MjvpHelper();
+        $cDb = new MjvpDb();
+        $cModuleConfig = new MjvpModuleConfig();
+
+        $carrier_id_reference = $params['carrier']['id_reference'];
+        $carrier_type = $cHelper->itIsThisModuleCarrier($carrier_id_reference);
+        $delivery_times = $this->getEnabledDeliveryTimes();
+        $courier = Carrier::getCarrierByReference($params['carrier']['id_reference']);
+
+        if ($carrier_type == 'courier') {
+
+            $configuration = [
+                'show_door_code' => Configuration::get($cModuleConfig->getConfigKey('door_code', 'COURIER')),
+                'show_cabinet_number' => Configuration::get($cModuleConfig->getConfigKey('cabinet_number', 'COURIER')),
+                'show_warehouse_number' => Configuration::get($cModuleConfig->getConfigKey('warehouse_number', 'COURIER')),
+                'show_delivery_time' => Configuration::get($cModuleConfig->getConfigKey('delivery_time', 'COURIER')),
+                'show_carrier_call' => Configuration::get($cModuleConfig->getConfigKey('call_before_delivery', 'COURIER')),
+                'delivery_times' => $delivery_times,
+                'venipakCarrierID' => $courier->id
+            ];
+
+
+            $cart = $params['cart'];
+            $order_extra_info = self::$_order_additional_info;
+
+            $sql_extra_info = $cDb->getOrderValue('other_info', array('id_cart' => $cart->id));
+            $sql_extra_info = (array) json_decode($sql_extra_info);
+
+            foreach ($order_extra_info as $key => $value) {
+                if (isset($sql_extra_info[$key])) {
+                    $order_extra_info[$key] = $sql_extra_info[$key];
+                }
+            }
+
+            $this->context->smarty->assign(
+                array_merge($configuration, $order_extra_info)
+            );
+            
+            return $this->context->smarty->fetch(self::$_moduleDir . '/views/templates/front/courier_extra_content.tpl');
+        }
+        elseif ($carrier_type == 'pickup')
+        {
+
+            $address = new Address($params['cart']->id_address_delivery);
+            $country_code = $this->getCountryCodeFromAddress($address);
+
+            if (empty($country_code)) {
+                return '';
+            }
+
+            /* Always overwrite terminals list in JS for some OnePage Checkout pages */
+            $controller_name = $this->getControllerNameFromContext();
+            $terminals_overwrite = false;
+            if ($controller_name == 'supercheckout') {
+                $terminals_overwrite = true;
+            }
+
+            try {
+                $cFiles = new MjvpFiles();
+                $all_terminals_info = $cFiles->getTerminalsListForCountry($country_code);
+
+                if (!is_array($all_terminals_info)) {
+                    $all_terminals_info = [];
+                }
+
+                $all_terminals_info = $this->filterTerminalsWithoutIdentification($all_terminals_info);
+
+                if (empty($all_terminals_info)) {
+                    $cHelper->writeToLog(
+                        'Pickup carrier extra content hidden: terminal list is empty after filtering entries without name/ID.'
+                        . ' Country: ' . $country_code . ', Cart ID: ' . $params['cart']->id,
+                        'terminals'
+                    );
+                    return '';
+                }
+            } catch (Exception $e) {
+                return '';
+            }
+
+            try {
+                $sql_terminal_id = $cDb->getOrderValue('terminal_id', array('id_cart' => $params['cart']->id));
+            } catch (Exception $e) {
+                $sql_terminal_id = '';
+            }
+
+            $quantity = 0;
+            foreach ($params['cart']->getProducts() as $product) {
+                $quantity = $quantity + $product['cart_quantity'];
+            }
+
+            $this->context->smarty->assign(
+                array(
+                    'terminals' => $all_terminals_info,
+                    'postcode' => $address->postcode,
+                    'city' => $address->city,
+                    'country_code' => $country_code,
+                    'selected_terminal' => $sql_terminal_id,
+                    'cart_quantity' => $quantity,
+                    'images_url' => $this->_path . 'views/images/',
+                    'is_16' => (version_compare(_PS_VERSION_, '1.7', '<')),
+                    'terminals_overwrite' => $terminals_overwrite,
+                    'mjvp_allowed_pickup_types' => $this->getAllowedPickupTypes(),
+                )
+            );
+
+            return $this->context->smarty->fetch(self::$_moduleDir . 'views/templates/front/pickuppoints_extra_content.tpl');
+        }
+    }
+
+    private function getControllerNameFromContext()
+    {
+        if (isset($this->context) && isset($this->context->controller)) {
+            if (isset($this->context->controller->name)) {
+                return $this->context->controller->name;
+            } elseif (isset($this->context->controller->php_self)) {
+                return $this->context->controller->php_self;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Hook for bulk actions (Work only until Prestashop 1.7.6)
+     */
+    public function hookActionAdminOrdersListingFieldsModifier($params)
+    {
+        if ($this->context->controller instanceof AdminOrdersController) {
+            $is_bulk_send_labels = Tools::isSubmit('submitBulkmjvp_send_labelsorder');
+            $is_bulk_print_labels = Tools::isSubmit('submitBulkmjvp_print_labelsorder');
+
+            try {
+                if (!isset($params['select']) && ($is_bulk_send_labels || $is_bulk_print_labels)) {
+                    $orders = Tools::getValue('orderBox');
+
+                    if (empty($orders)) {
+                        $this->context->controller->errors[] = $this->l('Select at least one order');
+                        return true;
+                    }
+
+                    if ($is_bulk_send_labels) {
+                        $warehouse_groups = $this->formatWarehousesOrderGroups($orders);
+                        if(!empty($warehouse_groups))
+                        {
+                            foreach ($warehouse_groups as $group)
+                            {
+                                $this->bulkActionSendLabels($group);
+                            }
+                        }
+                    }
+
+                    if ($is_bulk_print_labels) {
+                        $this->bulkActionPrintLabels($orders);
+                    }
+                }
+            } catch (Exception $e) {
+                $this->context->controller->errors[] = $e->getMessage();
+            }
+        }
+    }
+
+    public function checkFourHandsService($address)
+    {
+        $cApi = new MjvpApi();
+
+        $country_iso = $this->getCountryCodeFromAddress($address, false);
+        $postcode = $address->postcode;
+        try {
+            $response = $cApi->executeRequest('ws/get_route', 'GET', [
+                'queryParams' => [
+                    'country' => $country_iso,
+                    'code' => $postcode,
+                    'type' => 'all',
+                    'view' => 'json'
+                ]
+            ]);
+
+            if($response)
+            {
+                $response = (array) $response;
+                if(isset($response['service1']) && $response['service1'] === "1")
+                    return true;
+            }
+
+        } catch (Exception $e) {
+            return false;
+        }
+        return false;
+    }
+
+    /**
+     * Temporarily switch shop context to a specific shop.
+     * Returns previous context info for restoring later.
+     */
+    public function switchShopContext($id_shop)
+    {
+        if (!Shop::isFeatureActive() || !$id_shop) {
+            return null;
+        }
+        $prev = [
+            'context' => Shop::getContext(),
+            'id_shop' => Shop::getContextShopID(false),
+            'id_shop_group' => Shop::getContextShopGroupID(false),
+        ];
+        Shop::setContext(Shop::CONTEXT_SHOP, (int) $id_shop);
+        return $prev;
+    }
+
+    /**
+     * Restore previous shop context after switchShopContext().
+     */
+    public function restoreShopContext($prev)
+    {
+        if ($prev === null) {
+            return;
+        }
+        if ($prev['context'] === Shop::CONTEXT_ALL) {
+            Shop::setContext(Shop::CONTEXT_ALL);
+        } elseif ($prev['context'] === Shop::CONTEXT_GROUP) {
+            Shop::setContext(Shop::CONTEXT_GROUP, $prev['id_shop_group']);
+        } else {
+            Shop::setContext(Shop::CONTEXT_SHOP, $prev['id_shop']);
+        }
+    }
+
+    /**
+     * Hook to send labels when launch bulk action
+     */
+    public function bulkActionSendLabels($warehouse_group)
+    {
+        $warehouse_id = isset($warehouse_group['warehouse_id']) ? $warehouse_group['warehouse_id'] : 0;
+        $id_shop = isset($warehouse_group['id_shop']) ? (int) $warehouse_group['id_shop'] : 0;
+        $orders_ids = $warehouse_group['orders'];
+        $cApi = new MjvpApi();
+        $cHelper = new MjvpHelper();
+        $cDb = new MjvpDb();
+        $cModuleConfig = new MjvpModuleConfig();
+
+        // Switch to the target shop context for this batch
+        $prevShopCtx = $this->switchShopContext($id_shop);
+
+        $errors = [];
+        $success_orders = [];
+        $found = false;
+        $notfound_ids = [];
+        $manifest_errors = [];
+
+        if ( ! $warehouse_id ) {
+            $default_warehouse_id = $cDb->getValue('mjvp_warehouse', 'id', array('default_on' => 1));
+            if ( $default_warehouse_id ) {
+                $warehouse_id = $default_warehouse_id;
+            }
+        }
+
+        if ( ! $warehouse_id ) {
+            $this->restoreShopContext($prevShopCtx);
+            return array('errors' => array(
+                $this->l('Orders are not assigned a warehouse or their delivery method is not Venipak') . ': #' . implode(', #', $orders_ids),
+                sprintf($this->l('Please check that you have created a Warehouse and marked it as default in %s page'), '<a href="' . $this->context->link->getAdminLink('AdminVenipakWarehouse') . '">' . $this->l('Venipak Warehouses') . '</a>')
+            ));
+        }
+
+        /* Determine the manifest ID. If there exist manifest, which:
+                1. Was generated today;
+                2. Is assigned to a warehouse @$warehouse_id;
+                3. Is not closed;
+                4. Belongs to the same shop;
+            we include @$orders_ids in that manifest. */
+        $manifest_query = (new DbQuery())
+            ->select('id, manifest_id')
+            ->from('mjvp_manifest')
+            ->where('id_warehouse = ' . $warehouse_id . ' AND (closed IS NULL OR closed = 0) AND DATE(date_add) = DATE(NOW())');
+        if ($id_shop) {
+            $manifest_query->where('id_shop = ' . $id_shop);
+        }
+        $manifest_data = Db::getInstance()->getRow($manifest_query);
+
+        $manifest_title = '';
+        $manifest_id = 0;
+    
+        // In case client changed credentials, we cannot use the old. manifest title and id
+        $api_id = Configuration::getGlobalValue($cModuleConfig->getConfigKey('id', 'API'));
+        if($manifest_data)
+        {
+            if(substr($manifest_data['manifest_id'], 0, 5) == $api_id)
+            {
+                $manifest_title = $manifest_data['manifest_id'];
+                $manifest_id = $manifest_data['id'];
+            }
+        }
+
+        // If not found, build new one.
+        if(!$manifest_title)
+        {
+            $prev_manifest = json_decode(Configuration::getGlobalValue($this->_configKeysOther['counter_manifest']['key']));
+            $current_date = date('ymd');
+            $manifest_counter = ($current_date != $prev_manifest->date) ? 1 : (int)$prev_manifest->counter + 1;
+            $manifest_title = $cApi->buildManifestNumber($api_id, $manifest_counter);
+        }
+
+        Configuration::updateGlobalValue($cModuleConfig->getConfigKeyOther('last_manifest_id'), $manifest_title);
+        $manifest = array(
+            'manifest_name' => Configuration::get('PS_SHOP_NAME'),
+            'shipments' => array(),
+            'manifest_title' => $manifest_title
+        );
+
+        // Venipak returns batch of label numbers that have no relation to shipments for which label was generated, other than their order.
+        // This gets complicated when packs are used. So we sort orders (this way we will know which label number belongs to which order)
+        // and map each order to it's packages and parse the response accordingly.
+        sort($orders_ids);
+        $order_packages_mapping = [];
+
+        foreach ($orders_ids as $order_id) {
+            $error_order_no = ' #' . $order_id;
+            try {
+                $order = new Order((int)$order_id);
+
+                $address = new Address($order->id_address_delivery);
+                $carrier = new Carrier($order->id_carrier);
+                $customer = new Customer($order->id_customer);
+                if (!empty($order->id_carrier) && $cHelper->itIsThisModuleCarrier($carrier->id_reference)) {
+                    $found = true;
+                    $order_products = $order->getProducts();
+                    $country_iso = $this->getCountryCodeFromAddress($address, false);
+                    $consignee_name = $address->firstname . ' ' . $address->lastname;
+                    $consignee_code = '';
+                    if (!in_array($country_iso, $this->available_countries)) {
+                        $errors[$order_id][] = $this->l('Consignee country is not allowed');
+                        continue;
+                    }
+                    // Company code is optional: Venipak requires company name and code only together,
+                    // so without a code shipment is sent to a private person (first name + last name).
+                    $has_company_code = $address->dni || $address->vat_number || $customer->siret;
+                    if (($address->company || $customer->company) && $has_company_code) {
+                        $consignee_name = $address->company ?: $customer->company;
+                        if(!empty($address->dni)) {
+                            $consignee_code = $address->dni;
+                        } elseif(!empty($address->vat_number)) {
+                            $consignee_code = $address->vat_number;
+                        } else {
+                            $consignee_code = $customer->siret;
+                        }
+                    }
+                    $consignee_address = $address->address1;
+                    if (!empty($address->address2)) {
+                        $consignee_address .= ', ' . $address->address2;
+                    }
+                    $consignee_phone = (!empty($address->phone_mobile)) ? $address->phone_mobile : $address->phone;
+
+                    $order_info = $cDb->getOrderInfo($order_id);
+
+                    // Get other info fields for Venipak carrier (door code, cabinet number, warehouse, delivery time).
+                    $carrier_reference = $carrier->id_reference;
+                    $consignee = [];
+                    $currency = new Currency($order->id_currency);
+                    $currency_iso = strtoupper($currency->iso_code);
+                    $contact_person = '';
+                    $contact_phone = '';
+                    $contact_email = '';
+                    $address = new Address($order->id_address_delivery);
+                    if(Validate::isLoadedObject($address))
+                    {
+                        $contact_person = $address->firstname . ' ' . $address->lastname;
+                    }
+
+                    if(Validate::isLoadedObject($customer))
+                    {
+                        $contact_email = $customer->email;
+                    }
+
+                    $other_info = json_decode($cDb->getOrderValue('other_info', array('id_order' => $order_id)));
+                    if(empty($other_info) && !is_object($other_info)) {
+                        $other_info = new stdClass();
+                    }
+                    
+                    if(Configuration::get(self::$_carriers['courier']['reference_name']) == $carrier_reference) {
+                        $door_code = (property_exists($other_info, 'door_code')) ? $other_info->door_code : '';
+                        $cabinet_number = (property_exists($other_info, 'cabinet_number')) ? $other_info->cabinet_number : '';
+                        $warehouse_number = (property_exists($other_info, 'warehouse_number')) ? $other_info->warehouse_number : '';
+                        $delivery_time = (property_exists($other_info, 'delivery_time')) ? $other_info->delivery_time : 'nwd';
+                        $carrier_call = (property_exists($other_info, 'carrier_call')) ? $other_info->carrier_call : 0;
+                        $consignee = [
+                            'name' => $consignee_name,
+                            'code' => $consignee_code,
+                            'country_code' => $country_iso,
+                            'city' => $address->city,
+                            'address' => $consignee_address,
+                            'postcode' => $address->postcode,
+                            'person' => $contact_person,
+                            'email' => $contact_email,
+                            'phone' => $consignee_phone,
+                            'door_code' => $door_code,
+                            'cabinet_number' => $cabinet_number,
+                            'warehouse_number' => $warehouse_number,
+                            'carrier_call' => $carrier_call,
+                            'delivery_time' => $delivery_time,
+                            'return_doc' => isset($other_info->return_doc) ? $other_info->return_doc : 0,
+                            'cod' => $order_info['is_cod'] ? $order_info['cod_amount'] : '',
+                            'cod_type' => $order_info['is_cod'] ? $currency_iso : '',
+                        ];
+                    } elseif(Configuration::get(self::$_carriers['pickup']['reference_name']) == $carrier_reference) {
+                        // Update terminal with latest data, because outdated data might yield API errors.
+                        $terminal_id = $cDb->getOrderValue('terminal_id', ['id_order' => $order->id]);
+                        $terminal_info = $this->updateOrderTerminal($terminal_id, $country_iso, $order->id);
+                        if(empty($terminal_info)) {
+                            $terminal_info = json_decode($cDb->getOrderValue('terminal_info', array('id_order' => $order_id)));
+                        }
+                        if(empty($terminal_info)) {
+                            $errors[$order_id][] = $this->l('Failed to get selected terminal information');
+                            continue;
+                        }
+                        $consignee = [
+                            'name' => $terminal_info->name,
+                            'code' => $terminal_info->company_code,
+                            'country_code' => $terminal_info->country,
+                            'city' => $terminal_info->city,
+                            'address' => $terminal_info->address,
+                            'postcode' => $terminal_info->post_code,
+                            'person' => $contact_person,
+                            'phone' => $consignee_phone,
+                            'email' => $contact_email,
+                            'cod' => $order_info['is_cod'] ? $order_info['cod_amount'] : '',
+                            'cod_type' => $order_info['is_cod'] ? $currency_iso : '',
+                        ];
+                    }
+                    
+                    if(isset($other_info->return_service)) {
+                        $consignee['return_service'] = $other_info->return_service;
+                    }
+
+                    $packages = $order_info['packages'];
+                    $order_packages_mapping[$order_id] = $packages;
+                    $shipment_pack = [];
+                    $volume_unit = Configuration::get('PS_DIMENSION_UNIT');
+                    $volume_unit_divisors = array( //Volume divisors to m3
+                        'm' => 1,
+                        'cm' => 1000000,
+                        'mm' => 1000000000
+                    );
+                    for($i = 1; $i <= $packages; $i++) {
+                        $pack_no = (int)Configuration::get($this->_configKeysOther['counter_packs']['key']) + 1;
+                        $shipment_pack[$i] = array(
+                            'serial_number' => $pack_no,
+                            'document_number' => '',
+                            'weight' => Tools::ps_round($order_info['order_weight'] / $packages, 2),
+                            'volume' => 0,
+                        );
+                        foreach ($order_products as $key => $product) {
+                            // Calculate volume in m3
+                            if (isset($volume_unit_divisors[$volume_unit])) {
+                                $product_volume = ($product['width'] * $product['height'] * $product['depth']) / $volume_unit_divisors[$volume_unit];
+                            } else {
+                                $product_volume = 0;
+                            }
+                            $shipment_pack[$i]['volume'] += Tools::ps_round((float)$product_volume / $packages);
+                        }
+                        Configuration::updateValue($this->_configKeysOther['counter_packs']['key'], $pack_no);
+                    }
+                    $manifest['shipments'][] = array(
+                        'order_id' => $order_id,
+                        'order_code' => $order->reference,
+                        'consignee' => $consignee,
+                        'packs' => $shipment_pack,
+                        'id_shop' => (int) $order->id_shop,
+                    );
+
+                    $success_orders[] = $order_id;
+                } else {
+                    $notfound_ids[] = $order_id;
+                }
+            } catch (Exception $e) {
+                $errors[$order_id][] = $e->getMessage();
+            }
+        }
+
+        try {
+            // Add to manifest
+            $manifest_xml = $cApi->buildManifestXml($manifest);
+            // Do not call API when all orders failed validation (e.g. missing company code) - API would only
+            // return "No SHIPMENT in manifest found" and hide the real reason
+            if ($cHelper->isXMLContentValid($manifest_xml) && $found && !empty($manifest['shipments'])) {
+                $status = $cApi->sendXml($manifest_xml);
+                if(!isset($status['error']) && $status['text']) {
+                    // Update manifest counter immediately on success so subsequent calls get a new number
+                    if (!$manifest_id && isset($manifest_counter)) {
+                        Configuration::updateGlobalValue($this->_configKeysOther['counter_manifest']['key'], json_encode(array('counter' => $manifest_counter, 'date' => $current_date)));
+                    }
+
+                    $mjvp_manifest = ($manifest_id) ? new MjvpManifest($manifest_id) : new MjvpManifest();
+
+                    $mjvp_manifest->manifest_id = $manifest_title;
+                    $mjvp_manifest->id_warehouse = $warehouse_id;
+                    $mjvp_manifest->id_shop = $id_shop ? $id_shop : $this->context->shop->id;
+                    $mjvp_manifest->arrival_date_from = null;
+                    $mjvp_manifest->arrival_date_to = null;
+                    $mjvp_manifest->closed = 0;
+                    $mjvp_manifest->save(true);
+
+                    // Multiple labels - $status['text'] is array
+                    if(isset($status['text']) && is_array($status['text'])) {
+                        $offset = 0;
+                        foreach ($order_packages_mapping as $order_id => $mapping) {
+                            $error_prefix = $this->l('Order') . ' #' . $order_id . ': ';
+                            $order_labels = array_slice($status['text'], $offset, $mapping);
+                            if (empty($order_labels)) {
+                                $manifest_errors[] = $error_prefix . $this->l('Failed to get order labels');
+                                continue;
+                            }
+
+                            // Add first label number to OrderCarrier as tracking number.
+                            $id_order_carrier = (int) Db::getInstance()->getValue('
+                                SELECT `id_order_carrier`
+                                FROM `' . _DB_PREFIX_ . 'order_carrier`
+                                WHERE `id_order` = ' . (int) $order_id);
+                            $order_carrier = new OrderCarrier($id_order_carrier);
+                            $order_carrier->tracking_number = $order_labels[0];
+                            $order_carrier->save();
+
+                            $this->changeOrderStatus((int)$order_id, Configuration::get(self::$_order_states['order_state_ready']['key']));
+                            $cDb->updateRow('mjvp_orders', [
+                                'labels_numbers' => json_encode($order_labels),
+                                'manifest_id' => $manifest_title,
+                                'status' => 'registered',
+                                'labels_date' => date('Y-m-d h:i:s')],
+                                ['id_order' => $order_id]);
+                            $offset += $mapping;
+                        }
+                    } elseif(isset($status['text'])) {
+                        // Alternative for array_key_first, to support older PHP versions
+                        reset($order_packages_mapping);
+                        $id_order = key($order_packages_mapping);
+
+                        $id_order_carrier = (int) Db::getInstance()->getValue('
+                                SELECT `id_order_carrier`
+                                FROM `' . _DB_PREFIX_ . 'order_carrier`
+                                WHERE `id_order` = ' . (int) $id_order);
+                        $order_carrier = new OrderCarrier($id_order_carrier);
+                        $order_carrier->tracking_number = $status['text'];
+                        $order_carrier->save();
+
+                        $this->changeOrderStatus((int)$order_id, Configuration::get(self::$_order_states['order_state_ready']['key']));
+                        $cDb->updateRow('mjvp_orders', [
+                            'labels_numbers' => json_encode([$status['text']]),
+                            'manifest_id' => $manifest_title,
+                            'status' => 'registered',
+                            'labels_date' => date('Y-m-d h:i:s')],
+                            ['id_order' => $id_order]);
+                    }
+                } elseif (isset($status['error'])) {
+                    $error_shipments_txt = $this->getApiErrorShipments($status);
+                    $error_shipments = $this->getShipmentsByTrackingNumbers($manifest['shipments'], array_keys($error_shipments_txt));
+                    
+                    // Nullify successful orders array. If one order in manifest is incorrect, entire manifest fails.
+                    foreach ($success_orders as $order_id) {
+                        if ( empty($error_shipments) ) {
+                            $errors[$order_id][] = $this->l('Failed to create manifest');
+                            continue;
+                        }
+                        /*foreach ( $error_shipments as $error_shipment ) {
+                            if ( empty($error_shipment['order_id']) ) {
+                                continue;
+                            }
+                            if ( $order_id == $error_shipment['order_id'] ) {
+                                $errors[$order_id][] = $this->l('Order have error');
+                            }
+                        }*/
+                    }
+                    $success_orders = [];
+
+                    if (!empty($error_shipments)) {
+                        foreach ( $error_shipments as $track_number => $error_shipment ) {
+                            $errors[$error_shipment['order_id']][] = $error_shipments_txt[$track_number];
+                        }
+                        $errors['other'][] = $this->l('The manifest cannot be registered if there is an error in even one shipment. Please remove the indicated errors or unmark orders with errors.');
+                    }
+                    if (isset($status['error']['text'])) {
+                            $errors['other'][] = '<b>' . $this->l('Manifest API error') . ':</b> ' . $status['error']['text'];
+                    } elseif (is_array($status['error'])) {
+                        foreach ($status['error'] as $error) {
+                            $errors['other'][] = '<b>' . $this->l('Order API error') . ':</b> ' . $error['text'];
+                        }
+                    } else {
+                        $errors['other'][] = '<b>' . $this->l('Manifest API error') . ':</b> ' . $this->l('Unknown error'); 
+                    }
+                } elseif(!$manifest_id) {
+                    // Counter already updated in success path above; this handles edge case
+                    // where API returns neither error nor text
+                    if (isset($manifest_counter)) {
+                        Configuration::updateGlobalValue($this->_configKeysOther['counter_manifest']['key'], json_encode(array('counter' => $manifest_counter, 'date' => $current_date)));
+                    }
+                }
+            }
+        } catch (Exception $e) {
+            $errors['other'][] = $this->l('Error in manifest generation') . ': ' . $e->getMessage();
+        }
+
+        if (!$found) {
+            $errors['other'][] = $this->l('None of the selected orders have a Venipak shipping method');
+        } else if (!empty($notfound_ids)) {
+            $errors['other'][] = sprintf($this->l('Shipping method for orders %s is not Venipak.'), implode(', ', $notfound_ids));
+        }
+
+        if (isset($errors['other']['company_code'])) {
+            unset($errors['other']['company_code']); // Move info message to the end of the array
+            $errors['other']['company_code'] = '<i><b>*</b> ' . $this->l('It was detected that the company name is specified in the Order, but the company code is not specified. For sending shipment to the company, requires both of these parameters to be specified.') . '</i>';
+        }
+
+        $prepared_errors = array();
+        foreach ($errors as $order_id => $order_errors) {
+            if ($order_id != 'other') {
+                $this->changeOrderStatus((int)$order_id, Configuration::get(self::$_order_states['order_state_error']['key']));
+            }
+            foreach ($order_errors as $error_msg) {
+                $prepared_error_msg = $error_msg;
+                if ($order_id != 'other') {
+                    $prepared_error_msg = '<b>' . $this->l('Order') . ' #' . $order_id . ':</b> ' . $error_msg;
+                }
+                // Avoid dublicate error messages
+                if (!in_array($prepared_error_msg, $prepared_errors)) {
+                    $prepared_errors[] = $prepared_error_msg;
+                }
+            }
+        }
+
+        // Restore original shop context
+        $this->restoreShopContext($prevShopCtx);
+
+        if(version_compare(_PS_VERSION_, '1.7.7', '<') || (isset($this->context->controller->module) && $this->context->controller->module)) {
+            if (empty($errors)) {
+                $this->context->controller->confirmations[] = $this->l(sprintf('Successfully created label(s) for the manifest #%s.', $manifest_title));
+            } else {
+                $this->showErrors($prepared_errors);
+                if (!empty($success_orders)) {
+                    $this->context->controller->confirmations[] = $this->l('Successfully included orders in manifest') . ': ' . implode(', ', $success_orders) . '.';
+                }
+            }
+            return true;
+        } else { // for symfony controller
+            if (empty($errors)) {
+                return  ['success' => $this->l(sprintf('Successfully created label(s) for the manifest #%s.', $manifest_title))];
+            } else {
+                $return = ['errors' => $prepared_errors];
+                if (!empty($success_orders)) {
+                    $return['success'] = $this->l('Successfully included orders in manifest') . ': ' . implode(', ', $success_orders);
+                }
+                return $return;
+            }
+        }
+
+        return false;
+    }
+
+    private function getApiErrorShipments( $response )
+    {
+        $error_shipments = array();
+
+        if ( ! isset($response['error']) ) {
+            return $error_shipments;
+        }
+
+        if ( isset($response['error']['text']) ) {
+            $errors = array($response['error']);
+        } else if ( is_array($response['error']) ) {
+            $errors = $response['error'];
+        }
+
+        foreach ( $errors as $error ) {
+            if ( isset($error['@attributes']) && ! empty($error['@attributes']['pack']) ) {
+                $error_shipments[$error['@attributes']['pack']] = $error['text'];
+            }
+        }
+
+        return $error_shipments;
+    }
+
+    private function getShipmentsByTrackingNumbers( $shipments, $tracking_numbers )
+    {
+        $found_shipments = array();
+
+        foreach ( $tracking_numbers as $track_number ) {
+            $exploded_number = explode('E', $track_number);
+            if ( ! isset($exploded_number[1]) ) {
+                continue;
+            }
+            $shipment_serial_number = (int) $exploded_number[1];
+            foreach ( $shipments as $shipment ) {
+                if ( empty($shipment['packs']) ) {
+                    continue;
+                }
+                foreach ( $shipment['packs'] as $shipment_pack ) {
+                    if ( empty($shipment_pack['serial_number']) ) {
+                        continue;
+                    }
+                    if ( $shipment_serial_number == $shipment_pack['serial_number'] ) {
+                        $found_shipments[$track_number] = $shipment;
+                    }
+                }
+            }
+        }
+
+        return $found_shipments;
+    }
+
+    public function updateOrderTerminal($terminal_id, $country_code, $id_order)
+    {
+        $cFiles = new MjvpFiles();
+        $cDb = new MjvpDb();
+        $terminals_file = _PS_MODULE_DIR_ . $this->name . "/data/terminals_$country_code.json";
+        $terminals = json_decode($cFiles->getFileContent($terminals_file));
+        $terminalToUpdate = null;
+        foreach($terminals as $terminal)
+        {
+            if(!empty($terminal->id) && $terminal->id == $terminal_id)
+            {
+                $terminalToUpdate = $terminal;
+                break;
+            }
+        }
+        if($terminalToUpdate)
+        {
+            $sql_values['terminal_info'] = json_encode([
+                'name' => $terminal->name,
+                'company_code' => $terminal->code,
+                'country' => $terminal->country,
+                'city' => $terminal->city,
+                'address' => $terminal->address,
+                'post_code' => $terminal->zip,
+                'is_cod' => $terminal->cod_enabled
+            ]);
+            $result = $cDb->updateOrderInfo($id_order, $sql_values, 'id_order');
+            if($result)
+                return json_decode($sql_values['terminal_info']);
+        }
+
+        return null;
+    }
+
+    /**
+     * Mass label printing
+     */
+    public function bulkActionPrintLabels($orders_ids)
+    {
+        // Get all tracking numbers and invoke print_list
+        $cApi = new MjvpApi();
+        $labels_numbers_db = Db::getInstance()->executeS('SELECT `labels_numbers` FROM ' . _DB_PREFIX_ . "mjvp_orders
+            WHERE `id_order` IN (" . implode(',', $orders_ids) . ')');
+        $labels_numbers = [];
+        foreach ($labels_numbers_db as $labels_numbers_row)
+        {
+            if($labels_numbers_row['labels_numbers'])
+                $labels_numbers = array_merge($labels_numbers, json_decode($labels_numbers_row['labels_numbers'], true));
+        }
+        $cApi->printLabel($labels_numbers);
+    }
+
+    private function showErrors($errors)
+    {
+       foreach ($errors as $key => $error) {
+            $this->context->controller->errors[$key] = $error;
+        } 
+    }
+
+    public function hookActionValidateOrder($params)
+    {
+        $order = $params['order'];
+        $cart = $params['cart'];
+        $id_order = $order->id;
+        $id_cart = $cart->id;
+
+        $carrier = new Carrier($cart->id_carrier);
+        $carrier_reference = $carrier->id_reference;
+        if(!in_array($carrier_reference, Configuration::getMultiple([self::$_carriers['courier']['reference_name'], self::$_carriers['pickup']['reference_name']])))
+            return;
+
+        $cDb = new MjvpDb();
+        $check_order_id = $cDb->getOrderIdByCartId($id_cart);
+
+        if (empty($check_order_id)) {
+
+            $order_weight = $order->getTotalWeight();
+
+            // Convert to kg, if weight is in grams.
+            if(Configuration::get('PS_WEIGHT_UNIT') == 'g')
+                $order_weight *= 0.001;
+
+            $is_cod = 0;
+            if(in_array($order->module, self::$_codModules))
+                $is_cod = 1;
+
+             $cDb->updateOrderInfo($id_cart, array(
+                 'id_order' => $id_order,
+                 'warehouse_id' => MjvpWarehouse::getDefaultWarehouse(),
+                 'order_weight' => $order_weight,
+                 'cod_amount' => $order->total_paid_tax_incl,
+                 'is_cod' => $is_cod
+             ));
+        }
+    }
+
+    public function hookActionAdminControllerSetMedia()
+    {
+        $controller = $this->context->controller;
+        if (!$controller) {
+            return;
+        }
+
+        // On PS 1.7.7+/8/9 Symfony pages controller is AdminLegacyLayoutController (or its child), its
+        // controller_name holds legacy tab name (AdminOrders)
+        $controller_name = isset($controller->controller_name) ? (string) $controller->controller_name : '';
+        $is_orders_page = $controller instanceof AdminOrdersController
+            || $controller_name === 'AdminOrders'
+            || get_class($controller) === 'AdminLegacyLayoutControllerCore';
+        $is_module_page = isset($controller->module) && $controller->module instanceof Module
+            && $controller->module->name === $this->name;
+        $is_config_page = Tools::getValue('configure') == $this->name;
+
+        if ($is_orders_page || $is_module_page) {
+            Media::addJsDef([
+                'venipak_generate_label_url' => $this->context->link->getAdminLink('AdminVenipakshippingAjax') . '&action=generateLabel',
+                'venipak_save_order_url' => $this->context->link->getAdminLink('AdminVenipakshippingAjax') . '&action=saveOrder',
+                'venipak_tracking_url' => $this->context->link->getAdminLink('AdminVenipakshippingAjax') . '&action=trackOrders',
+            ]);
+        }
+
+        if ($is_orders_page || $is_module_page || $is_config_page) {
+            $controller->addJS($this->_path . 'views/js/mjvp-admin.js');
+            $controller->addCSS($this->_path . 'views/css/mjvp-admin.css');
+        }
+    }
+
+    private function filterTerminalsByWeight($terminals, $entity)
+    {
+        if($entity instanceof OrderCore || $entity instanceof CartCore)
+        {
+            if (! is_array($terminals)) {
+                return [];
+            }
+            $weight = $entity->getTotalWeight();
+            foreach ($terminals as $key => $terminal)
+            {
+                // Zero means no limit
+                if($terminal->size_limit == 0)
+                    continue;
+                if(isset($terminal->size_limit) && $terminal->size_limit < $weight)
+                    unset($terminals[$key]);
+            }
+            return $terminals;
+        }
+        else
+        {
+            return [];
+        }
+    }
+
+    public function filterTerminalsByDimensions($terminals, $entity)
+    {
+        if($entity instanceof Order || $entity instanceof Cart)
+        {
+            $items = $this->getBoxCalculatorItems($entity->getProducts());
+            if(empty($items))
+                return $terminals;
+
+            foreach ($terminals as $key => $terminal)
+            {
+                // Zero means no limit
+                if($terminal->max_height == 0 || $terminal->max_width == 0 || $terminal->max_length == 0)
+                    continue;
+
+                $boxCalculator = new Mijora\BoxCalculator\CalculateBox($items);
+                $boxCalculator->setBoxWallThickness(0);
+                $boxCalculator->setMethod('Heuristic3D');
+                $boxCalculator->setMaxBoxSize(
+                    !empty($terminal->max_width) ? $terminal->max_width : 999999,
+                    !empty($terminal->max_height) ? $terminal->max_height : 999999,
+                    !empty($terminal->max_length) ? $terminal->max_length : 999999
+                );
+                $boxSize = $boxCalculator->findBoxSizeUntilMaxSize();
+
+                if($boxSize === false)
+                {
+                    unset($terminals[$key]);
+                }
+            }
+            return $terminals;
+        }
+
+        return $terminals;
+    }
+
+    private function getBoxCalculatorItems($products)
+    {
+        $divisor = Configuration::get('PS_DIMENSION_UNIT') == 'cm' ? 100 : 1;
+        $items = [];
+
+        foreach($products as $product)
+        {
+            $width = (float) $product['width'] / $divisor;
+            $height = (float) $product['height'] / $divisor;
+            $depth = (float) $product['depth'] / $divisor;
+
+            if($width <= 0 || $height <= 0 || $depth <= 0)
+                continue;
+
+            for($i = 0; $i < (int) $product['quantity']; $i++)
+            {
+                $items[] = new Mijora\BoxCalculator\Elements\Item($width, $height, $depth);
+            }
+        }
+
+        return $items;
+    }
+
+    public function getCountryCodeFromAddress($address = null, $use_default_country = true)
+    {
+        $country_id = 0;
+
+        if (is_numeric($address) && (int) $address > 0) {
+            $address = new Address((int) $address);
+        }
+
+        if ($address instanceof AddressCore && Validate::isLoadedObject($address) && !empty($address->id_country)) {
+            $country_id = (int) $address->id_country;
+        }
+
+        if (!$country_id && $use_default_country) {
+            $country_id = (int) Configuration::get('PS_COUNTRY_DEFAULT');
+        }
+
+        if (!$country_id) {
+            return '';
+        }
+
+        $country_code = Country::getIsoById($country_id);
+
+        return !empty($country_code) ? (string) $country_code : '';
+    }
+
+    public function getFilteredTerminals($filters = [], $entity = null)
+    {
+        if(!$entity && isset($this->context->cart))
+            $entity = $this->context->cart;
+
+        if($entity instanceof OrderCore || $entity instanceof CartCore) {
+            $country_code = $this->getCountryCodeFromAddress($entity->id_address_delivery);
+
+            if (empty($country_code)) {
+                return [];
+            }
+
+            $cFiles = new MjvpFiles();
+            $all_terminals_info = $cFiles->getTerminalsListForCountry($country_code, false, $filters);
+            if(!is_array($all_terminals_info))
+                $all_terminals_info = [];
+            $all_terminals_info = $this->filterTerminalsWithoutIdentification($all_terminals_info);
+            $filtered_terminals = $this->filterTerminalsByWeight($all_terminals_info, $entity);
+            $filtered_terminals = $this->filterTerminalsByDimensions($filtered_terminals, $entity);
+            $filtered_terminals = $this->filterTerminalsByConfigTypes($filtered_terminals);
+            $filtered_terminals = array_values($filtered_terminals);
+            return $filtered_terminals;
+        }
+        else
+        {
+            return [];
+        }
+    }
+
+    /**
+     * Filter terminals by allowed types from module configuration
+     */
+    private function filterTerminalsByConfigTypes($terminals)
+    {
+        $allowed_types = $this->getAllowedPickupTypes();
+
+        if (empty($allowed_types)) {
+            return [];
+        }
+
+        return array_filter($terminals, function($terminal) use ($allowed_types) {
+            $type = is_object($terminal) ? ($terminal->type ?? null) : ($terminal['type'] ?? null);
+            return in_array((int)$type, $allowed_types);
+        });
+    }
+
+    /**
+     * Get allowed pickup point types from configuration
+     * Returns array of allowed type integers (1 = Pickups, 3 = Lockers)
+     */
+    public function getAllowedPickupTypes()
+    {
+        $saved_types = Configuration::get('MJVP_PICKUP_POINT_TYPES');
+
+        // Default to all types enabled if not set
+        if ($saved_types === false || $saved_types === '') {
+            return [1, 3];
+        }
+
+        $types = explode(',', $saved_types);
+        return array_map('intval', array_filter($types, function($v) { return $v !== ''; }));
+    }
+
+    /**
+     * Remove terminals that do not have a name or ID
+     */
+    private function filterTerminalsWithoutIdentification($terminals)
+    {
+        if (!is_array($terminals)) {
+            return [];
+        }
+
+        return array_filter($terminals, function($terminal) {
+            $id = is_object($terminal) ? ($terminal->id ?? null) : ($terminal['id'] ?? null);
+            $name = is_object($terminal) ? ($terminal->name ?? null) : ($terminal['name'] ?? null);
+
+            return !empty($id) && !empty($name);
+        });
+    }
+
+    public function getTerminalById($terminals, $terminal_id)
+    {
+        foreach ($terminals as $terminal)
+        {
+            if ($terminal->id == $terminal_id)
+            {
+                return $terminal;
+            }
+        }
+        return false;
+    }
+
+    private function getEnabledDeliveryTimes()
+    {
+        $delivery_times =  [];
+        foreach ($this->deliveryTimes as $key => $deliveryTime)
+        {
+            if(Configuration::get('MJVP_COURIER_DELIVERY_TIME_' . strtoupper($key)))
+                $delivery_times[$key] = $deliveryTime;
+        }
+        return $delivery_times;
+    }
+
+    public function formatWarehousesOrderGroups($orders)
+    {
+        $cDb = new MjvpDb();
+        $warehouse_groups = [];
+        foreach ($orders as $order_id)
+        {
+            $warehouse_id = (int) $cDb->getOrderValue('warehouse_id', array('id_order' => $order_id));
+            $order = new Order((int) $order_id);
+            $id_shop = (int) $order->id_shop;
+            $group_key = $warehouse_id . '_' . $id_shop;
+            if (!isset($warehouse_groups[$group_key])) {
+                $warehouse_groups[$group_key] = [
+                    'warehouse_id' => $warehouse_id,
+                    'id_shop' => $id_shop,
+                    'orders' => [],
+                ];
+            }
+            $warehouse_groups[$group_key]['orders'][] = $order_id;
+        }
+        return $warehouse_groups;
+    }
+
+    public function changeOrderStatus($id_order, $status)
+    {
+        $order = new Order((int)$id_order);
+        if ($order->current_state != $status)
+        {
+            $history = new OrderHistory();
+            $history->id_order = (int)$id_order;
+            $history->id_employee = Context::getContext()->employee->id;
+            $history->changeIdOrderState((int)$status, $order);
+            $order->update();
+            $history->addWithemail(true);
+        }
+    }
+
+    public function hookDisplayAdminListBefore($params)
+    {
+        if (get_class($this->context->controller) == 'AdminOrdersController')
+        {
+            $smarty = $params['smarty'];
+            $bulk_actions = $smarty->getVariable('bulk_actions')->value;
+            $bulk_actions['mjvp_send_labels'] = [
+                'text' => $this->l('Generate Venipak labels'),
+                'icon' => 'icon-cloud-upload'
+            ];
+            $bulk_actions['mjvp_print_labels'] = [
+                'text' => $this->l('Print Venipak labels'),
+                'icon' => 'icon-print'
+            ];
+            $this->context->smarty->assign(
+                array(
+                    'bulk_actions' => $bulk_actions,
+                )
+            );
+        }
+    }
+
+    public function hookdisplayAdminGridTableBefore($params)
+    {
+        $this->hookDisplayAdminListBefore($params);
+    }
+
+    /**
+     * Use hook to add Bulk actions for printing and generating labels on Orders page (1.7.7)
+     */
+    // note: cannot "use PrestaShop\PrestaShop\Core\Grid\Action\Bulk\Type\SubmitBulkAction",
+    // because 1.6 breaks with any use statement in the module main file...
+    public function hookActionOrderGridDefinitionModifier($params)
+    {
+        $params['definition']->getBulkActions()->add(
+            (new PrestaShop\PrestaShop\Core\Grid\Action\Bulk\Type\SubmitBulkAction('mjvp_bulk_generate_labels'))
+                ->setName('Venipak generate labels')
+                ->setOptions([
+                    'submit_route' => 'admin_venipak_generate_bulk',
+                ])
+        );
+        $params['definition']->getBulkActions()->add(
+            (new PrestaShop\PrestaShop\Core\Grid\Action\Bulk\Type\SubmitBulkAction('mjvp_bulk_print_labels'))
+                ->setName('Venipak print labels')
+                ->setOptions([
+                    'submit_route' => 'admin_venipak_print_bulk',
+                ])
+        );
+    }
+
+    /**
+     * Use hook to validate carrier selection in Prestashop 1.6
+     */
+    public function hookActionCarrierProcess($params)
+    {
+        // This hook fires on PS 1.7+ too (during carrier processing), but validation
+        // there is handled by hookActionValidateStepComplete directly. Only act on PS 1.6.
+        if (version_compare(_PS_VERSION_, '1.7', '>=')) {
+            return;
+        }
+
+        $data = [
+            'step_name' => 'delivery',
+            'cart' => $params['cart'],
+            'is_submit' => true
+        ];
+        $this->hookActionValidateStepComplete($data);
+
+        if (!empty(self::$_checkout_errors)) {
+            $this->showErrors(self::$_checkout_errors);
+        }
+    }
+
+
+    /**
+     * Re calculate shipping cost. Cloned from 1.7, as 1.6 does not have this.
+     *
+     * @return object $order
+     */
+    public function refreshShippingCost($order)
+    {
+        if (empty($order->id)) {
+            return false;
+        }
+
+        if (!Configuration::get('PS_ORDER_RECALCULATE_SHIPPING')) {
+            return $order;
+        }
+
+        $fake_cart = new Cart((int) $order->id_cart);
+        $new_cart = $fake_cart->duplicate();
+        $new_cart = $new_cart['cart'];
+
+        // assign order id_address_delivery to cart
+        $new_cart->id_address_delivery = (int) $order->id_address_delivery;
+
+        // assign id_carrier
+        $new_cart->id_carrier = (int) $order->id_carrier;
+
+        //remove all products : cart (maybe change in the meantime)
+        foreach ($new_cart->getProducts() as $product) {
+            $new_cart->deleteProduct((int) $product['id_product'], (int) $product['id_product_attribute']);
+        }
+
+        // add real order products
+        foreach ($order->getProducts() as $product) {
+            $new_cart->updateQty(
+                $product['product_quantity'],
+                (int) $product['product_id'],
+                null,
+                false,
+                'up',
+                0,
+                null,
+                true,
+                true
+            ); // - skipAvailabilityCheckOutOfStock
+        }
+
+        // get new shipping cost
+        $base_total_shipping_tax_incl = $new_cart->getPackageShippingCost((int) $new_cart->id_carrier, true, null);
+        $base_total_shipping_tax_excl = $new_cart->getPackageShippingCost((int) $new_cart->id_carrier, false, null);
+        if(!$base_total_shipping_tax_incl || !$base_total_shipping_tax_excl)
+            return false;
+
+        // calculate diff price, then apply new order totals
+        $diff_shipping_tax_incl = $order->total_shipping_tax_incl - (float) $base_total_shipping_tax_incl;
+        $diff_shipping_tax_excl = $order->total_shipping_tax_excl - (float) $base_total_shipping_tax_excl;
+
+        $order->total_shipping_tax_excl -= $diff_shipping_tax_excl;
+        $order->total_shipping_tax_incl -= $diff_shipping_tax_incl;
+        $order->total_shipping = $order->total_shipping_tax_incl;
+        $order->total_paid_tax_excl -= $diff_shipping_tax_excl;
+        $order->total_paid_tax_incl -= $diff_shipping_tax_incl;
+        $order->total_paid = $order->total_paid_tax_incl;
+        $order->update();
+
+        // save order_carrier prices, we'll save order right after this in update() method
+        $orderCarrierId = (int) $order->getIdOrderCarrier();
+        if ($orderCarrierId > 0) {
+            $order_carrier = new OrderCarrier($orderCarrierId);
+            $order_carrier->id_carrier = (int) $order->id_carrier;
+            $order_carrier->shipping_cost_tax_excl = $order->total_shipping_tax_excl;
+            $order_carrier->shipping_cost_tax_incl = $order->total_shipping_tax_incl;
+            $order_carrier->update();
+        }
+
+        // remove fake cart
+        $new_cart->delete();
+
+        return $order;
+    }
+
+    public function createVenipakOrderIfNotExists($order)
+    {
+        // Fix issue if customer selected Venipak carrier/terminal, but order data was not registered.
+        // As that functionality is handled by JavaScript, the problem is possible due to browser's cache.
+        $cDb = $this->getModuleService('MjvpDb');
+        $venipak_cart_info = $cDb->getOrderInfoByCartId($order->id_cart);
+
+        $carrier = new Carrier($order->id_carrier);
+        $address = new Address($order->id_address_delivery);
+        $country_code = $this->getCountryCodeFromAddress($address);
+        $order_weight = $order->getTotalWeight();
+        // Convert to kg, if weight is in grams.
+        if(Configuration::get('PS_WEIGHT_UNIT') == 'g')
+            $order_weight *= 0.001;
+
+        $is_cod = 0;
+        if(in_array($order->module, MijoraVenipak::$_codModules))
+            $is_cod = 1;
+
+        if(!$venipak_cart_info)
+        {
+            $newOrderData = [
+                'id_order' => $order->id,
+                'id_cart' => $order->id_cart,
+                'id_carrier_ref' => Validate::isLoadedObject($carrier) ? $carrier->id_reference : NULL,
+                'order_weight' => $order_weight,
+                'is_cod' => $is_cod,
+                'cod_amount' => $order->total_paid_tax_incl,
+                'country_code' => $country_code,
+                'last_select' => date('Y-m-d H:i:s'),
+            ];
+            $res = $cDb->saveOrderInfo($newOrderData);
+            return $res;
+        } else if (empty($venipak_cart_info['id_order'])) {
+            $update_values = array('id_order' => $order->id);
+            if (empty($venipak_cart_info['country_code']))
+                $update_values['country_code'] = $country_code;
+            if (empty($venipak_cart_info['order_weight']) && !empty($order_weight))
+                $update_values['order_weight'] = $order_weight;
+            if (empty($venipak_cart_info['is_cod']) && !empty($is_cod)) {
+                $update_values['is_cod'] = $is_cod;
+            }
+            if (empty($venipak_cart_info['cod_amount'])) {
+                $update_values['cod_amount'] = $order->total_paid_tax_incl;
+            }
+            if (empty($venipak_cart_info['id_carrier_ref']) && Validate::isLoadedObject($carrier)) {
+                $update_values['id_carrier_ref'] = $carrier->id_reference;
+            }
+            if (empty($venipak_cart_info['warehouse_id'])) {
+                $update_values['warehouse_id'] = MjvpWarehouse::getDefaultWarehouse();
+            }
+
+            $cDb->updateOrderInfo($order->id_cart, $update_values);
+        }
+        return true;
+    }
+
+    public function getCorrectWarehouseId($warehouse_id)
+    {
+        if ( empty(MjvpWarehouse::getWarehouses()) ) {
+            return 0;
+        }
+        $warehouse_id = (int) $warehouse_id;
+
+        $warehouse = $this->getModuleService('MjvpWarehouse', $warehouse_id);
+        if ( ! Validate::isLoadedObject($warehouse) ) {
+            return MjvpWarehouse::getDefaultWarehouse();
+        }
+
+        return $warehouse_id;
+    }
+}
